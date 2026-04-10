@@ -6,7 +6,7 @@ import re
 import uuid
 from typing import Literal
 
-from pydantic import BaseModel, UrlConstraints, field_validator
+from pydantic import BaseModel, UrlConstraints, field_validator, model_validator
 from pydantic import HttpUrl as _HttpUrl
 
 RESERVED_NAMES: frozenset[str] = frozenset(
@@ -22,6 +22,15 @@ class HttpsUrl(_HttpUrl):
     """HTTP URL constrained to HTTPS scheme only."""
 
     _constraints = UrlConstraints(max_length=2083, allowed_schemes=["https"])
+
+
+def _validate_profile_name(v: str) -> str:
+    """Shared name validation for Profile and BalancingProfile."""
+    if not _NAME_PATTERN.match(v):
+        raise ValueError(f"name must match {_NAME_PATTERN.pattern!r} (lowercase, 1-32 chars)")
+    if v in RESERVED_NAMES:
+        raise ValueError(f"name {v!r} is reserved")
+    return v
 
 
 class Profile(BaseModel):
@@ -43,11 +52,7 @@ class Profile(BaseModel):
     @field_validator("name")
     @classmethod
     def validate_name(cls, v: str) -> str:
-        if not _NAME_PATTERN.match(v):
-            raise ValueError(f"name must match {_NAME_PATTERN.pattern!r} (lowercase, 1-32 chars)")
-        if v in RESERVED_NAMES:
-            raise ValueError(f"name {v!r} is reserved")
-        return v
+        return _validate_profile_name(v)
 
     @field_validator("model")
     @classmethod
@@ -65,4 +70,34 @@ class Profile(BaseModel):
         return v
 
 
-__all__ = ["RESERVED_NAMES", "Profile"]
+class BalancingProfile(BaseModel):
+    """A profile that round-robins LLM calls across a list of regular profiles.
+
+    Balancing profiles cannot be nested — members must all be regular profiles.
+    """
+
+    model_config = {"frozen": True}
+
+    name: str
+    members: list[str]
+    is_default: bool = False
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, v: str) -> str:
+        return _validate_profile_name(v)
+
+    @model_validator(mode="after")
+    def validate_members(self) -> BalancingProfile:
+        if len(self.members) < 2:
+            raise ValueError("balancing profile must have at least 2 members")
+        if len(self.members) != len(set(self.members)):
+            raise ValueError("balancing profile members must not contain duplicates")
+        if self.name in self.members:
+            raise ValueError(f"balancing profile {self.name!r} must not self-reference in members")
+        return self
+
+
+BackendConfig = Profile | BalancingProfile
+
+__all__ = ["RESERVED_NAMES", "Profile", "BalancingProfile", "BackendConfig"]

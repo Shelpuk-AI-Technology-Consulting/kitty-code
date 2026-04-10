@@ -13,15 +13,43 @@ from typing import Any
 import filelock
 from platformdirs import user_config_dir
 
-from kitty.profiles.schema import Profile
+from kitty.profiles.schema import BalancingProfile, BackendConfig, Profile
 
 logger = logging.getLogger(__name__)
 
 STORE_VERSION = 1
 
+_TYPE_REGULAR = "regular"
+_TYPE_BALANCING = "balancing"
+
+
+def _deserialize_entry(item: dict[str, Any]) -> BackendConfig | None:
+    """Deserialize a store entry to Profile or BalancingProfile."""
+    entry_type = item.get("type", _TYPE_REGULAR)
+    try:
+        if entry_type == _TYPE_BALANCING:
+            return BalancingProfile.model_validate(item)
+        else:
+            # Regular profile — strip type if present for backward compat
+            data = {k: v for k, v in item.items() if k != "type"}
+            return Profile.model_validate(data)
+    except Exception:
+        logger.warning("Skipping invalid profile entry in store")
+        return None
+
+
+def _serialize_entry(config: BackendConfig) -> dict[str, Any]:
+    """Serialize a Profile or BalancingProfile with type discriminator."""
+    data = config.model_dump(mode="json")
+    if isinstance(config, BalancingProfile):
+        data["type"] = _TYPE_BALANCING
+    else:
+        data["type"] = _TYPE_REGULAR
+    return data
+
 
 class ProfileStore:
-    """Persistent store for Profile objects backed by a JSON file.
+    """Persistent store for Profile and BalancingProfile objects backed by a JSON file.
 
     Uses filelock for concurrent access safety and atomic writes
     (write to temp file + os.replace) for crash resilience.
@@ -36,7 +64,11 @@ class ProfileStore:
         self._lock = filelock.FileLock(str(path) + ".lock")
 
     def load_all(self) -> list[Profile]:
-        """Read all profiles from the store. Returns empty list on missing/corrupt file."""
+        """Read all regular profiles from the store. Returns empty list on missing/corrupt file."""
+        return [p for p in self.get_all_backends() if isinstance(p, Profile)]
+
+    def get_all_backends(self) -> list[BackendConfig]:
+        """Read all backends (profiles and balancing profiles) from the store."""
         try:
             with self._lock:
                 raw = self._path.read_text(encoding="utf-8")
@@ -48,26 +80,25 @@ class ProfileStore:
             logger.warning("Store version mismatch or corrupt data in %s", self._path)
             return []
 
-        profiles: list[Profile] = []
+        results: list[BackendConfig] = []
         for item in data.get("profiles", []):
-            try:
-                profiles.append(Profile.model_validate(item))
-            except Exception:
-                logger.warning("Skipping invalid profile entry in store")
-        return profiles
+            entry = _deserialize_entry(item)
+            if entry is not None:
+                results.append(entry)
+        return results
 
-    def save(self, profile: Profile) -> None:
-        """Upsert a profile. Enforces single-default invariant atomically."""
+    def save(self, config: BackendConfig) -> None:
+        """Upsert a profile or balancing profile. Enforces single-default invariant atomically."""
         with self._lock:
             profiles = self._load_raw()
             # Remove existing entry with same name (case-insensitive)
-            name_lower = profile.name.lower()
+            name_lower = config.name.lower()
             profiles = [p for p in profiles if p["name"].lower() != name_lower]
-            # If this profile is default, clear previous default
-            if profile.is_default:
+            # If this entry is default, clear previous default
+            if config.is_default:
                 for p in profiles:
                     p["is_default"] = False
-            profiles.append(profile.model_dump(mode="json"))
+            profiles.append(_serialize_entry(config))
             self._write_raw(profiles)
 
     def delete(self, name: str) -> None:
@@ -81,11 +112,18 @@ class ProfileStore:
                 self._write_raw(profiles)
 
     def get(self, name: str) -> Profile | None:
-        """Get a profile by name (case-insensitive). Returns None if not found."""
+        """Get a regular profile by name (case-insensitive). Returns None if not found or if balancing."""
+        backend = self.get_backend(name)
+        if isinstance(backend, Profile):
+            return backend
+        return None
+
+    def get_backend(self, name: str) -> BackendConfig | None:
+        """Get any backend (Profile or BalancingProfile) by name (case-insensitive)."""
         name_lower = name.lower()
-        for profile in self.load_all():
-            if profile.name.lower() == name_lower:
-                return profile
+        for backend in self.get_all_backends():
+            if backend.name.lower() == name_lower:
+                return backend
         return None
 
     def _load_raw(self) -> list[dict[str, Any]]:

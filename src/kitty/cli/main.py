@@ -84,13 +84,15 @@ def main() -> None:
     elif result.builtin == BuiltinCommand.CLEANUP:
         _run_cleanup()
     elif result.builtin == BuiltinCommand.BRIDGE:
-        if result.profile is None:
+        backend = result.backend or result.profile
+        if backend is None:
             parser.error("No default profile configured. Create one with 'kitty setup' first.")
             sys.exit(1)
-        _run_bridge(result.profile, cred_store, debug=args.debug, validate=not args.no_validate)
-    elif result.adapter is not None and result.profile is not None:
+        _run_bridge(backend, cred_store, debug=args.debug, validate=not args.no_validate)
+    elif result.adapter is not None and (result.backend is not None or result.profile is not None):
+        backend = result.backend or result.profile
         exit_code = _launch_target(
-            result.adapter, result.profile, cred_store,
+            result.adapter, backend, cred_store,
             result.extra_args, debug=args.debug,
             validate=not args.no_validate,
         )
@@ -127,7 +129,7 @@ def _run_cleanup() -> None:
 
 
 def _run_bridge(
-    profile: object,
+    backend: object,
     cred_store: object,
     *,
     debug: bool = False,
@@ -143,8 +145,15 @@ def _run_bridge(
 
     from kitty.bridge.server import BridgeServer
     from kitty.credentials.store import CredentialStore
+    from kitty.profiles.schema import BalancingProfile, Profile
     from kitty.providers.registry import get_provider
     from kitty.tui.display import print_error
+
+    if isinstance(backend, BalancingProfile):
+        _run_bridge_balancing(backend, cred_store, debug=debug, validate=validate)
+        return
+
+    profile = backend  # type: ignore[assignment]
 
     # Resolve API key from credential store
     auth_ref = profile.auth_ref  # type: ignore[union-attr]
@@ -186,7 +195,7 @@ def _run_bridge(
             f"  • POST /v1/chat/completions\n"
             f"  • GET  /healthz\n\n"
             f"Press Ctrl+C to stop",
-            title="🌉 Kitty Bridge Mode",
+            title="Kitty Bridge Mode",
             border_style="green",
         ))
 
@@ -213,9 +222,104 @@ def _run_bridge(
     sys.exit(0)
 
 
+def _run_bridge_balancing(
+    balancing: BalancingProfile,
+    cred_store: object,
+    *,
+    debug: bool = False,
+    validate: bool = True,
+) -> None:
+    """Run bridge mode with a balancing profile — round-robin across member profiles."""
+    import asyncio
+    import signal
+    import sys
+
+    from rich.console import Console
+    from rich.panel import Panel
+
+    from kitty.bridge.server import BridgeServer
+    from kitty.credentials.store import CredentialStore
+    from kitty.profiles.resolver import ProfileResolver
+    from kitty.profiles.store import ProfileStore
+    from kitty.providers.registry import get_provider
+    from kitty.tui.display import print_error
+
+    # Resolve all member profiles
+    store: ProfileStore = cred_store  # type: ignore[assignment]  # We need the store — get it from the router context
+    # Actually, we need to resolve members from the store
+    from kitty.credentials.file_backend import FileBackend
+    from kitty.profiles.store import ProfileStore as _PS
+    profile_store = _PS()
+    resolver = ProfileResolver(profile_store)
+    member_profiles = resolver.resolve_balancing(balancing.name)
+
+    # Build backends list: (provider, resolved_key, profile)
+    backends = []
+    for mp in member_profiles:
+        key = cred_store.get(mp.auth_ref)  # type: ignore[union-attr]
+        if not key:
+            print_error(f"No API key found for member profile {mp.name!r}")
+            sys.exit(1)
+        provider = get_provider(mp.provider)
+        backends.append((provider, key, mp))
+
+    # Create bridge server with balancing backends
+    first_provider = backends[0][0]
+    first_key = backends[0][1]
+    server = BridgeServer(
+        adapter=None,  # type: ignore[arg-type]
+        provider=first_provider,
+        resolved_key=first_key,
+        model=member_profiles[0].model,
+        debug=debug,
+        backends=backends,
+    )
+
+    async def run_server() -> None:
+        port = await server.start_async()
+
+        console = Console()
+        members_info = "\n".join(
+            f"  • [cyan]{mp.name}[/cyan] ({mp.provider}/{mp.model})"
+            for mp in member_profiles
+        )
+        console.print(Panel.fit(
+            f"[bold green]Bridge server running on http://127.0.0.1:{port}[/bold green]\n\n"
+            f"Profile: [cyan]{balancing.name}[/cyan] (balancing)\n"
+            f"Members:\n{members_info}\n\n"
+            f"Endpoints:\n"
+            f"  • POST /v1/chat/completions\n"
+            f"  • GET  /healthz\n\n"
+            f"Press Ctrl+C to stop",
+            title="Kitty Bridge Mode (Balancing)",
+            border_style="green",
+        ))
+
+        stop_event = asyncio.Event()
+
+        def signal_handler(sig: int, frame: object) -> None:
+            stop_event.set()
+
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+
+        try:
+            await stop_event.wait()
+        finally:
+            console.print("\n[yellow]Shutting down bridge server...[/yellow]")
+            await server.stop_async()
+            console.print("[green]Bridge server stopped.[/green]")
+
+    try:
+        asyncio.run(run_server())
+    except KeyboardInterrupt:
+        pass
+    sys.exit(0)
+
+
 def _launch_target(
     adapter: object,
-    profile: object,
+    backend: object,
     cred_store: object,
     extra_args: list[str],
     *,
@@ -223,8 +327,13 @@ def _launch_target(
     validate: bool = True,
 ) -> int:
     from kitty.cli.launcher import launch
+    from kitty.profiles.schema import BalancingProfile
     from kitty.providers.registry import get_provider
 
+    if isinstance(backend, BalancingProfile):
+        return _launch_target_balancing(adapter, backend, cred_store, extra_args, debug=debug, validate=validate)
+
+    profile = backend
     return launch(
         adapter=adapter,  # type: ignore[arg-type]
         provider=get_provider(profile.provider),  # type: ignore[union-attr]
@@ -233,4 +342,50 @@ def _launch_target(
         extra_args=extra_args,
         debug=debug,
         validate=validate,
+    )
+
+
+def _launch_target_balancing(
+    adapter: object,
+    balancing: BalancingProfile,
+    cred_store: object,
+    extra_args: list[str],
+    *,
+    debug: bool = False,
+    validate: bool = True,
+) -> int:
+    """Launch a coding agent with a balancing profile (round-robin across members)."""
+    from kitty.cli.launcher import launch
+    from kitty.profiles.resolver import ProfileResolver
+    from kitty.profiles.store import ProfileStore
+    from kitty.providers.registry import get_provider
+
+    profile_store = ProfileStore()
+    resolver = ProfileResolver(profile_store)
+    member_profiles = resolver.resolve_balancing(balancing.name)
+
+    # Build backends list
+    backends = []
+    for mp in member_profiles:
+        key = cred_store.get(mp.auth_ref)  # type: ignore[union-attr]
+        if not key:
+            from kitty.tui.display import print_error
+            print_error(f"No API key found for member profile {mp.name!r}")
+            return 1
+        provider = get_provider(mp.provider)
+        backends.append((provider, key, mp))
+
+    # Use first member's provider/model for adapter spawn config
+    first_profile = member_profiles[0]
+    first_provider = backends[0][0]
+
+    return launch(
+        adapter=adapter,  # type: ignore[arg-type]
+        provider=first_provider,
+        profile=first_profile,
+        cred_store=cred_store,  # type: ignore[arg-type]
+        extra_args=extra_args,
+        debug=debug,
+        validate=validate,
+        backends=backends,
     )

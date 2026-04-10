@@ -61,6 +61,7 @@ class BridgeServer:
         model: str | None = None,
         debug: bool = False,
         provider_config: dict | None = None,
+        backends: list[tuple[ProviderAdapter, str, object]] | None = None,
     ) -> None:
         self._adapter = adapter
         self._provider = provider
@@ -75,6 +76,36 @@ class BridgeServer:
         self._session: aiohttp.ClientSession | None = None
         self._thinking_warned = False
         self._log_path: Path | None = None
+
+        # Balancing mode: list of (provider, resolved_key, profile) tuples
+        self._backends = backends
+        self._backend_index = 0
+
+        # Active backend for current request (set by _select_backend)
+        self._active_provider = provider
+        self._active_key = resolved_key
+        self._active_model = model
+        self._active_provider_config = provider_config or {}
+
+    def _get_next_backend(self) -> tuple[ProviderAdapter, str, str | None]:
+        """Select the next backend in round-robin order.
+
+        Returns (provider, resolved_key, model).
+        """
+        if self._backends:
+            backend = self._backends[self._backend_index % len(self._backends)]
+            self._backend_index = (self._backend_index + 1) % len(self._backends)
+            provider, key, profile = backend
+            return provider, key, profile.model  # type: ignore[union-attr]
+        return self._provider, self._resolved_key, self._model
+
+    def _select_backend(self) -> None:
+        """Select next backend and set active fields for the current request."""
+        provider, key, model = self._get_next_backend()
+        self._active_provider = provider
+        self._active_key = key
+        self._active_model = model
+        self._active_provider_config = getattr(self, "_provider_config", {}) if not self._backends else {}
 
     @property
     def port(self) -> int:
@@ -186,6 +217,7 @@ class BridgeServer:
     # ── Responses API handler ─────────────────────────────────────────────
 
     async def _handle_responses(self, request: web.Request) -> web.StreamResponse:
+        self._select_backend()
         try:
             body = await request.json()
         except (json.JSONDecodeError, Exception):
@@ -201,7 +233,7 @@ class BridgeServer:
         translator = ResponsesTranslator()
         cc_request = translator.translate_request(body)
         self._normalize_model(cc_request)
-        self._provider.normalize_request(cc_request)
+        self._active_provider.normalize_request(cc_request)
 
         logger.debug("Translated CC request: %s", json.dumps(cc_request, indent=2, ensure_ascii=False))
 
@@ -258,7 +290,7 @@ class BridgeServer:
             headers = self._build_upstream_headers()
             logger.debug("Upstream POST → %s", url)
 
-            upstream_body = self._provider.translate_to_upstream(cc_request)
+            upstream_body = self._active_provider.translate_to_upstream(cc_request)
             stream_timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=_STREAM_READ_TIMEOUT)
 
             # Retry loop for retryable upstream errors
@@ -394,6 +426,7 @@ class BridgeServer:
     # ── Messages API handler ──────────────────────────────────────────────
 
     async def _handle_messages(self, request: web.Request) -> web.StreamResponse:
+        self._select_backend()
         try:
             body = await request.json()
         except web.HTTPRequestEntityTooLarge:
@@ -417,7 +450,7 @@ class BridgeServer:
         translator = MessagesTranslator(thinking_warned=self._thinking_warned)
         cc_request = translator.translate_request(body)
         self._normalize_model(cc_request)
-        self._provider.normalize_request(cc_request)
+        self._active_provider.normalize_request(cc_request)
         self._thinking_warned = translator.thinking_warned
 
         logger.debug("Translated CC request: %s", json.dumps(cc_request, indent=2, ensure_ascii=False))
@@ -469,7 +502,7 @@ class BridgeServer:
             session = await self._get_session()
             url = self._build_upstream_url()
             headers = self._build_upstream_headers()
-            upstream_body = self._provider.translate_to_upstream(cc_request)
+            upstream_body = self._active_provider.translate_to_upstream(cc_request)
             logger.debug("Upstream POST → %s", url)
 
             stream_timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=_STREAM_READ_TIMEOUT)
@@ -579,6 +612,7 @@ class BridgeServer:
 
     async def _handle_gemini(self, request: web.Request) -> web.StreamResponse:
         """Handle Gemini generateContent / streamGenerateContent requests."""
+        self._select_backend()
         model_from_path = request.match_info["model"]
 
         try:
@@ -597,7 +631,7 @@ class BridgeServer:
         # Inject model from URL path so _normalize_model can override it
         cc_request["model"] = model_from_path
         self._normalize_model(cc_request)
-        self._provider.normalize_request(cc_request)
+        self._active_provider.normalize_request(cc_request)
 
         logger.debug("Translated CC request: %s", json.dumps(cc_request, indent=2, ensure_ascii=False))
 
@@ -652,7 +686,7 @@ class BridgeServer:
             session = await self._get_session()
             url = self._build_upstream_url()
             headers = self._build_upstream_headers()
-            upstream_body = self._provider.translate_to_upstream(cc_request)
+            upstream_body = self._active_provider.translate_to_upstream(cc_request)
             logger.debug("Upstream POST → %s", url)
 
             stream_timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=_STREAM_READ_TIMEOUT)
@@ -758,6 +792,7 @@ class BridgeServer:
         also expects CC format.  We only apply model normalization and provider
         normalization.
         """
+        self._select_backend()
         try:
             body = await request.json()
         except (json.JSONDecodeError, Exception):
@@ -771,7 +806,7 @@ class BridgeServer:
 
         cc_request = body
         self._normalize_model(cc_request)
-        self._provider.normalize_request(cc_request)
+        self._active_provider.normalize_request(cc_request)
 
         logger.debug("Normalized CC request: %s", json.dumps(cc_request, indent=2, ensure_ascii=False))
 
@@ -817,7 +852,7 @@ class BridgeServer:
             session = await self._get_session()
             url = self._build_upstream_url()
             headers = self._build_upstream_headers()
-            upstream_body = self._provider.translate_to_upstream(cc_request)
+            upstream_body = self._active_provider.translate_to_upstream(cc_request)
             logger.debug("Upstream POST → %s", url)
 
             stream_timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=_STREAM_READ_TIMEOUT)
@@ -854,7 +889,7 @@ class BridgeServer:
                     # Success path — pass-through stream
                     async for chunk_bytes in upstream.content:
                         try:
-                            for translated in self._provider.translate_upstream_stream_event(chunk_bytes):
+                            for translated in self._active_provider.translate_upstream_stream_event(chunk_bytes):
                                 await sr.write(translated)
                         except (ConnectionResetError, BrokenPipeError, OSError):
                             logger.debug("Client disconnected during streaming")
@@ -895,15 +930,15 @@ class BridgeServer:
         provider always receives the correct model name, regardless of which
         model the agent (e.g. Claude Code) selected internally.
         """
-        if self._model is not None:
+        if self._active_model is not None:
             original = cc_request.get("model")
-            cc_request["model"] = self._model
-            if original != self._model:
-                logger.debug("Overrode model: %s -> %s", original, self._model)
+            cc_request["model"] = self._active_model
+            if original != self._active_model:
+                logger.debug("Overrode model: %s -> %s", original, self._active_model)
 
         model = cc_request.get("model")
         if model:
-            normalized = self._provider.normalize_model_name(model)
+            normalized = self._active_provider.normalize_model_name(model)
             if normalized != model:
                 logger.debug("Normalized model: %s -> %s", model, normalized)
             cc_request["model"] = normalized
@@ -1005,13 +1040,13 @@ class BridgeServer:
         return details
 
     def _build_upstream_url(self) -> str:
-        base = self._provider.build_base_url(self._provider_config).rstrip("/")
-        model = self._model or ""
-        path = self._provider.get_upstream_path(model)
+        base = self._active_provider.build_base_url(self._active_provider_config).rstrip("/")
+        model = self._active_model or ""
+        path = self._active_provider.get_upstream_path(model)
         return f"{base}{path}"
 
     def _build_upstream_headers(self) -> dict[str, str]:
-        return self._provider.build_upstream_headers(self._resolved_key)
+        return self._active_provider.build_upstream_headers(self._active_key)
 
     async def _make_upstream_request(self, cc_request: dict) -> dict:
         """Send a non-streaming request upstream.
@@ -1023,15 +1058,15 @@ class BridgeServer:
         Returns the upstream response dict (in CC format) on success.
         Raises UpstreamError(status, body) on non-retryable or exhausted failures.
         """
-        if self._provider.use_custom_transport:
-            cc_request["_resolved_key"] = self._resolved_key
-            cc_request["_provider_config"] = self._provider_config
-            return await self._provider.make_request(cc_request)
+        if self._active_provider.use_custom_transport:
+            cc_request["_resolved_key"] = self._active_key
+            cc_request["_provider_config"] = self._active_provider_config
+            return await self._active_provider.make_request(cc_request)
 
         session = await self._get_session()
         url = self._build_upstream_url()
         headers = self._build_upstream_headers()
-        upstream_body = self._provider.translate_to_upstream(cc_request)
+        upstream_body = self._active_provider.translate_to_upstream(cc_request)
 
         request_timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=_STREAM_READ_TIMEOUT)
 
@@ -1046,7 +1081,7 @@ class BridgeServer:
                     last_body = {}
 
                 if last_status < 400:
-                    return self._provider.translate_from_upstream(last_body)
+                    return self._active_provider.translate_from_upstream(last_body)
 
                 if last_status in _RETRYABLE_STATUSES and attempt < _MAX_RETRIES:
                     delay = _BACKOFF_BASE * (2**attempt)

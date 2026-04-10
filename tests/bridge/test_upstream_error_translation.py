@@ -1,0 +1,116 @@
+"""Tests for upstream error translation — Z.AI code 1261 and related error handling."""
+
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from kitty.bridge.server import BridgeServer
+
+
+class TestTranslateUpstreamError:
+    """Unit tests for BridgeServer._translate_upstream_error."""
+
+    @staticmethod
+    def _call(status: int, body: object) -> str:
+        return BridgeServer._translate_upstream_error(status, body)
+
+    # ── Z.AI code 1261: Prompt exceeds max length ─────────────────────────
+
+    @pytest.mark.parametrize(
+        "status",
+        [400, 429, 500, 502],
+        ids=["400", "429", "500", "502"],
+    )
+    def test_zai_1261_dict_body(self, status: int):
+        """Z.AI 1261 error with dict body returns actionable /clear message."""
+        body = {"error": {"code": "1261", "message": "Prompt exceeds max length"}}
+        result = self._call(status, body)
+        assert "/clear" in result
+        assert "context" in result.lower()
+
+    @pytest.mark.parametrize(
+        "status",
+        [400, 429, 500, 502],
+        ids=["400", "429", "500", "502"],
+    )
+    def test_zai_1261_string_body(self, status: int):
+        """Z.AI 1261 error with raw JSON string body returns actionable /clear message."""
+        body = json.dumps({"error": {"code": "1261", "message": "Prompt exceeds max length"}})
+        result = self._call(status, body)
+        assert "/clear" in result
+        assert "context" in result.lower()
+
+    def test_zai_1261_integer_code(self):
+        """Z.AI 1261 error with integer code (not string) still detected."""
+        body = {"error": {"code": 1261, "message": "Prompt exceeds max length"}}
+        result = self._call(400, body)
+        assert "/clear" in result
+        assert "context" in result.lower()
+
+    def test_zai_1261_message_match_fallback(self):
+        """Detection via message substring when code is missing."""
+        body = {"error": {"message": "Prompt exceeds max length"}}
+        result = self._call(400, body)
+        assert "/clear" in result
+
+    def test_zai_1261_string_body_integer_code(self):
+        """Z.AI 1261 error with raw JSON string containing integer code."""
+        body = json.dumps({"error": {"code": 1261, "message": "Prompt exceeds max length"}})
+        result = self._call(400, body)
+        assert "/clear" in result
+
+    # ── Backward compatibility: non-1261 errors ────────────────────────────
+
+    def test_400_non_1261_returns_details(self):
+        """Non-1261 400 errors return raw details (backward compat)."""
+        body = {"error": {"code": "1210", "message": "Incorrect API call parameters"}}
+        result = self._call(400, body)
+        # Should NOT contain /clear
+        assert "/clear" not in result
+        # Should contain the error info
+        assert "1210" in result or "Incorrect" in result
+
+    def test_400_string_body_non_json(self):
+        """Non-JSON string body on 400 returns the raw string."""
+        result = self._call(400, "Something went wrong")
+        assert result == "Something went wrong"
+
+    # ── Backward compatibility: auth errors ────────────────────────────────
+
+    def test_401_returns_auth_error(self):
+        """401 errors return authentication failure message."""
+        body = {"error": "Unauthorized"}
+        result = self._call(401, body)
+        assert "authentication failed" in result.lower()
+        assert "kitty setup" in result.lower()
+
+    def test_403_returns_auth_error(self):
+        """403 errors return authentication failure message."""
+        body = {"error": "Forbidden"}
+        result = self._call(403, body)
+        assert "authentication failed" in result.lower()
+        assert "kitty setup" in result.lower()
+
+    # ── Backward compatibility: 500 with code 1234 ─────────────────────────
+
+    def test_500_code_1234_network_failure(self):
+        """500 with code 1234 returns network failure message."""
+        body = {"error": {"code": "1234", "message": "Network error, error id: abc-123"}}
+        result = self._call(500, body)
+        assert "network" in result.lower()
+        assert "retry" in result.lower()
+
+    def test_500_generic(self):
+        """Generic 500 returns internal failure message."""
+        body = {"error": {"message": "Internal server error"}}
+        result = self._call(500, body)
+        assert "internal failure" in result.lower()
+        assert "retry" in result.lower()
+
+    def test_500_string_body(self):
+        """500 with string body still works."""
+        body = json.dumps({"error": {"code": "1234", "message": "Network error"}})
+        result = self._call(500, body)
+        assert "network" in result.lower()

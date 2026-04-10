@@ -7,7 +7,7 @@ from enum import Enum
 
 from kitty.launchers.base import LauncherAdapter
 from kitty.profiles.resolver import ProfileResolver
-from kitty.profiles.schema import Profile
+from kitty.profiles.schema import BackendConfig, Profile
 from kitty.profiles.store import ProfileStore
 
 __all__ = ["BuiltinCommand", "CLIRouter", "RouteResult"]
@@ -32,7 +32,8 @@ class RouteResult:
     """Result of routing CLI arguments."""
 
     adapter: LauncherAdapter | None = None
-    profile: Profile | None = None
+    profile: Profile | None = None  # Kept for backward compat (regular profiles only)
+    backend: BackendConfig | None = None  # Any backend type (Profile or BalancingProfile)
     extra_args: list[str] = field(default_factory=list)
     builtin: BuiltinCommand | None = None
     needs_setup: bool = False
@@ -51,7 +52,7 @@ class CLIRouter:
     Routing priority:
     1. Built-in command (setup, profile, doctor)
     2. Launcher target (codex, claude)
-    3. Profile name (case-insensitive)
+    3. Profile/backend name (case-insensitive)
     4. No match -- raise RoutingError
 
     When no profiles exist in the store, every route resolves to SETUP.
@@ -77,7 +78,7 @@ class CLIRouter:
                 profile is configured.
         """
         # When the profile store is empty, always direct to setup.
-        if not self._store.load_all():
+        if not self._store.get_all_backends():
             return RouteResult(builtin=BuiltinCommand.SETUP, needs_setup=True)
 
         if not args:
@@ -94,29 +95,32 @@ class CLIRouter:
 
         # 2. Bridge command (standalone or with profile)
         if builtin == BuiltinCommand.BRIDGE:
-            profile = self._resolver.resolve_default()
-            return RouteResult(builtin=builtin, profile=profile, extra_args=rest)
+            backend = self._resolver.resolve_default_backend()
+            profile = backend if isinstance(backend, Profile) else None
+            return RouteResult(builtin=builtin, profile=profile, backend=backend, extra_args=rest)
 
         # 3. Launcher target match
         adapter = self._adapters.get(head_lower)
         if adapter is not None:
-            profile = self._resolver.resolve_default()
-            return RouteResult(adapter=adapter, profile=profile, extra_args=rest)
+            backend = self._resolver.resolve_default_backend()
+            profile = backend if isinstance(backend, Profile) else None
+            return RouteResult(adapter=adapter, profile=profile, backend=backend, extra_args=rest)
 
-        # 4. Profile name match (profile may be followed by bridge or agent)
-        profile = self._store.get(head_lower)
-        if profile is not None:
+        # 4. Profile/backend name match (may be followed by bridge or agent)
+        backend = self._store.get_backend(head_lower)
+        if backend is not None:
+            profile = backend if isinstance(backend, Profile) else None
             # Second arg may be bridge or a launcher target
             if rest:
                 second = rest[0].lower()
                 if second == "bridge":
-                    return RouteResult(builtin=BuiltinCommand.BRIDGE, profile=profile, extra_args=rest[1:])
+                    return RouteResult(builtin=BuiltinCommand.BRIDGE, profile=profile, backend=backend, extra_args=rest[1:])
                 if second in self._adapters:
                     adapter = self._adapters[second]
-                    return RouteResult(adapter=adapter, profile=profile, extra_args=rest[1:])
+                    return RouteResult(adapter=adapter, profile=profile, backend=backend, extra_args=rest[1:])
             # Default to codex if no target specified
             adapter = self._adapters[_DEFAULT_ADAPTER_KEY]
-            return RouteResult(adapter=adapter, profile=profile, extra_args=rest)
+            return RouteResult(adapter=adapter, profile=profile, backend=backend, extra_args=rest)
 
         # 5. No match
         raise RoutingError(f"Unknown command or profile: {head!r}")
