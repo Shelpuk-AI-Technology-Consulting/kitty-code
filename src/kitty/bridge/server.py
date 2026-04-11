@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
+import ssl
+import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 import aiohttp
@@ -63,7 +67,19 @@ class BridgeServer:
         debug: bool = False,
         provider_config: dict | None = None,
         backends: list[tuple[ProviderAdapter, str, Profile]] | None = None,
+        access_log_path: str | None = None,
+        profile_name: str = "default",
+        keys_file: str | None = None,
+        tls_cert: str | None = None,
+        tls_key: str | None = None,
+        state_file: str | None = None,
     ) -> None:
+        # TLS validation: both or neither
+        if tls_cert and not tls_key:
+            raise ValueError("tls_cert provided without tls_key — both are required for TLS")
+        if tls_key and not tls_cert:
+            raise ValueError("tls_key provided without tls_cert — both are required for TLS")
+
         self._adapter = adapter
         self._provider = provider
         self._resolved_key = resolved_key
@@ -77,6 +93,25 @@ class BridgeServer:
         self._session: aiohttp.ClientSession | None = None
         self._thinking_warned = False
         self._log_path: Path | None = None
+
+        # Access logging
+        self._access_log_path = access_log_path
+        self._access_log_file = None
+        self._profile_name = profile_name
+
+        # State file
+        self._state_file = state_file
+
+        # API key authentication
+        self._keys_entries: dict[str, str | None] = {}  # key -> profile_name or None
+        if keys_file:
+            from kitty.bridge.keys import parse_keys_file
+            entries = parse_keys_file(keys_file)
+            self._keys_entries = {e.key: e.profile for e in entries}
+
+        # TLS
+        self._tls_cert = tls_cert
+        self._tls_key = tls_key
 
         # Balancing mode: list of (provider, resolved_key, profile) tuples
         self._backends = backends
@@ -147,14 +182,44 @@ class BridgeServer:
 
     # ── Lifecycle ─────────────────────────────────────────────────────────
 
+    def _should_warn_no_tls(self) -> bool:
+        """Return True if binding to non-localhost without TLS."""
+        if self._tls_cert and self._tls_key:
+            return False
+        host = self._host
+        return host not in ("127.0.0.1", "localhost", "::1")
+
     async def start_async(self) -> int:
         """Create the aiohttp app, register routes, start listening. Returns bound port."""
         self._log_path = self._setup_debug_logging()
-        self._app = web.Application(client_max_size=_CLIENT_MAX_SIZE)
+
+        # Open access log file if configured
+        if self._access_log_path:
+            log_path = Path(self._access_log_path)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            self._access_log_file = open(log_path, "a", encoding="utf-8")
+
+        # TLS warning
+        if self._should_warn_no_tls():
+            import sys
+            print(
+                f"WARNING: Binding to {self._host} without TLS. "
+                "API keys and responses will be sent in plain text.",
+                file=sys.stderr,
+            )
+
+        self._app = web.Application(client_max_size=_CLIENT_MAX_SIZE, middlewares=[self._auth_middleware, self._access_log_middleware])
         self._register_routes(self._app)
         self._runner = web.AppRunner(self._app)
         await self._runner.setup()
-        site = web.TCPSite(self._runner, self._host, self._port)
+
+        # Build SSL context if TLS is configured
+        ssl_context = None
+        if self._tls_cert and self._tls_key:
+            ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ssl_context.load_cert_chain(self._tls_cert, self._tls_key)
+
+        site = web.TCPSite(self._runner, self._host, self._port, ssl_context=ssl_context)
         await site.start()
         for site_obj in self._runner.sites:
             if isinstance(site_obj, web.TCPSite):
@@ -164,6 +229,22 @@ class BridgeServer:
                     break
         logger.info("Bridge server started on %s:%d", self._host, self._port)
         logger.info("Debug log: %s", self._log_path)
+
+        # Write state file if configured
+        if self._state_file:
+            from kitty.bridge.state import BridgeState, write_state
+            import os
+            from datetime import datetime, timezone
+            state = BridgeState(
+                pid=os.getpid(),
+                host=self._host,
+                port=self._port,
+                profile=self._profile_name,
+                started_at=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                tls=bool(self._tls_cert and self._tls_key),
+            )
+            write_state(self._state_file, state)
+
         return self._port
 
     def start(self) -> int:
@@ -179,6 +260,13 @@ class BridgeServer:
             await self._session.close()
             self._session = None
         self._app = None
+        if self._access_log_file is not None:
+            self._access_log_file.close()
+            self._access_log_file = None
+        # Remove state file
+        if self._state_file:
+            from kitty.bridge.state import remove_state
+            remove_state(self._state_file)
         logger.info("Bridge server stopped")
 
     def stop(self) -> None:
@@ -189,11 +277,25 @@ class BridgeServer:
 
     def _register_routes(self, app: web.Application) -> None:
         app.router.add_get("/healthz", self._handle_healthz)
-        # If no adapter is set (bridge mode), default to Chat Completions API
+
+        # Bridge mode (no adapter): register ALL protocol endpoints
         if self._adapter is None:
-            protocol = BridgeProtocol.CHAT_COMPLETIONS_API
-        else:
-            protocol = self._adapter.bridge_protocol
+            app.router.add_post("/v1/chat/completions", self._handle_chat_completions)
+            app.router.add_post("/v1/messages", self._handle_messages)
+            app.router.add_post("/v1/responses", self._handle_responses)
+            app.router.add_post(
+                "/v1beta/models/{model:.*}:generateContent",
+                self._handle_gemini,
+            )
+            app.router.add_post(
+                "/v1beta/models/{model:.*}:streamGenerateContent",
+                self._handle_gemini,
+            )
+            app.router.add_get("/v1/models", self._handle_models)
+            return
+
+        # Agent launch mode: register only the matching protocol
+        protocol = self._adapter.bridge_protocol
         if protocol == BridgeProtocol.RESPONSES_API:
             app.router.add_post("/v1/responses", self._handle_responses)
         elif protocol == BridgeProtocol.MESSAGES_API:
@@ -210,10 +312,102 @@ class BridgeServer:
         elif protocol == BridgeProtocol.CHAT_COMPLETIONS_API:
             app.router.add_post("/v1/chat/completions", self._handle_chat_completions)
 
+    # ── Auth middleware ────────────────────────────────────────────────────
+
+    @web.middleware
+    async def _auth_middleware(self, request: web.Request, handler: object) -> web.StreamResponse:
+        # If no keys configured, allow all
+        if not self._keys_entries:
+            return await handler(request)  # type: ignore[misc]
+
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            token = auth_header[7:]
+        else:
+            token = None
+
+        if not token or token not in self._keys_entries:
+            return web.json_response({"error": "Unauthorized"}, status=401)
+
+        # Store key info for access logging
+        import hashlib
+        key_hash = hashlib.sha256(token.encode()).hexdigest()[:8]
+        request["_key_id"] = key_hash
+        request["_profile_name"] = self._profile_name
+
+        # If key maps to a profile, store it for the handler to use
+        mapped_profile = self._keys_entries[token]
+        if mapped_profile is not None:
+            request["_mapped_profile"] = mapped_profile
+
+        return await handler(request)  # type: ignore[misc]
+
+    # ── Access log middleware ─────────────────────────────────────────────
+
+    @web.middleware
+    async def _access_log_middleware(self, request: web.Request, handler: object) -> web.StreamResponse:
+        import asyncio as _asyncio
+
+        start = time.monotonic()
+        response: web.StreamResponse | None = None
+        try:
+            response = await handler(request)  # type: ignore[misc]
+        except web.HTTPException:
+            raise
+        except Exception:
+            # Let the default error handler deal with it
+            response = web.json_response({"error": "Internal server error"}, status=500)
+        finally:
+            if self._access_log_file is not None:
+                elapsed_ms = int((time.monotonic() - start) * 1000)
+                self._write_access_log(request, response, elapsed_ms)
+
+        return response  # type: ignore[return-value]
+
+    def _write_access_log(self, request: web.Request, response: web.StreamResponse | None, elapsed_ms: int) -> None:
+        if self._access_log_file is None:
+            return
+
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        client_ip = request.remote or "-"
+        # key_id: will be populated by auth middleware later; for now '-'
+        key_id = request.get("_key_id", "-")
+        profile = request.get("_profile_name", self._profile_name)
+        method = request.method
+        path = request.path
+        status = response.status if response is not None else 500
+
+        bytes_in = request.content_length if request.content_length else "-"
+        bytes_out = response.content_length if (response is not None and hasattr(response, "content_length") and response.content_length) else "-"
+
+        line = f"{now}\t{client_ip}\t{key_id}\t{profile}\t{method}\t{path}\t{status}\t{bytes_in}\t{bytes_out}\t{elapsed_ms}\n"
+        self._access_log_file.write(line)
+        self._access_log_file.flush()
+
     # ── Health check ──────────────────────────────────────────────────────
 
     async def _handle_healthz(self, request: web.Request) -> web.Response:
         return web.json_response({"status": "ok"})
+
+    async def _handle_models(self, request: web.Request) -> web.Response:
+        """Return OpenAI-compatible model list."""
+        import time
+
+        models = []
+        if self._backends:
+            for _provider, _key, profile in self._backends:
+                models.append(profile.model)
+        elif self._model:
+            models.append(self._model)
+
+        now = int(time.time())
+        return web.json_response({
+            "object": "list",
+            "data": [
+                {"id": m, "object": "model", "created": now, "owned_by": "kitty-bridge"}
+                for m in models
+            ],
+        })
 
     # ── Responses API handler ─────────────────────────────────────────────
 

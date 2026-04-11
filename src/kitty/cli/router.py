@@ -21,6 +21,13 @@ class BuiltinCommand(str, Enum):
     DOCTOR = "doctor"
     CLEANUP = "cleanup"
     BRIDGE = "bridge"
+    BRIDGE_START = "bridge-start"
+    BRIDGE_STOP = "bridge-stop"
+    BRIDGE_RESTART = "bridge-restart"
+    BRIDGE_STATUS = "bridge-status"
+    BRIDGE_CONFIG = "bridge-config"
+    BRIDGE_INSTALL = "bridge-install"
+    BRIDGE_UNINSTALL = "bridge-uninstall"
 
 
 class RoutingError(Exception):
@@ -93,8 +100,15 @@ class CLIRouter:
         if builtin is not None and builtin != BuiltinCommand.BRIDGE:
             return RouteResult(builtin=builtin, extra_args=rest)
 
-        # 2. Bridge command (standalone or with profile)
+        # 2. Bridge command (standalone or with profile) and bridge subcommands
         if builtin == BuiltinCommand.BRIDGE:
+            # Check for subcommand: bridge start, bridge stop, etc.
+            if rest:
+                subcommand = rest[0].lower()
+                sub_key = f"bridge-{subcommand}"
+                sub_builtin = _BUILTIN_MAP.get(sub_key)
+                if sub_builtin is not None:
+                    return RouteResult(builtin=sub_builtin, extra_args=rest[1:])
             backend = self._resolver.resolve_default_backend()
             profile = backend if isinstance(backend, Profile) else None
             return RouteResult(builtin=builtin, profile=profile, backend=backend, extra_args=rest)

@@ -83,6 +83,118 @@ def main() -> None:
         _run_doctor(profile_store)
     elif result.builtin == BuiltinCommand.CLEANUP:
         _run_cleanup()
+    elif result.builtin == BuiltinCommand.BRIDGE_START:
+        from pathlib import Path as _Path
+        from platformdirs import user_config_dir as _ucd
+        _config_dir = _Path(_ucd("kitty"))
+        from kitty.bridge.manage import start_bridge
+        start_bridge(
+            state_path=_config_dir / "bridge_state.json",
+            config_path=_config_dir / "bridge.yaml",
+        )
+    elif result.builtin == BuiltinCommand.BRIDGE_STOP:
+        from pathlib import Path as _Path
+        from platformdirs import user_config_dir as _ucd
+        _config_dir = _Path(_ucd("kitty"))
+        from kitty.bridge.manage import stop_bridge
+        stop_bridge(_config_dir / "bridge_state.json")
+    elif result.builtin == BuiltinCommand.BRIDGE_RESTART:
+        from pathlib import Path as _Path
+        from platformdirs import user_config_dir as _ucd
+        _config_dir = _Path(_ucd("kitty"))
+        from kitty.bridge.manage import restart_bridge
+        restart_bridge(
+            state_path=_config_dir / "bridge_state.json",
+            config_path=_config_dir / "bridge.yaml",
+        )
+    elif result.builtin == BuiltinCommand.BRIDGE_STATUS:
+        from pathlib import Path as _Path
+        from platformdirs import user_config_dir as _ucd
+        _config_dir = _Path(_ucd("kitty"))
+        from kitty.bridge.manage import bridge_status, BridgeStatus
+        from kitty.bridge.state import load_state
+        _state_path = _config_dir / "bridge_state.json"
+        status = bridge_status(_state_path)
+        if status == BridgeStatus.RUNNING:
+            state = load_state(_state_path)
+            scheme = "https" if state.tls else "http"
+            print(f"Running: {scheme}://{state.host}:{state.port} (profile={state.profile}, PID {state.pid})")
+            sys.exit(0)
+        elif status == BridgeStatus.STALE:
+            print("Stale state file found (process not running). Run 'kitty bridge stop' to clean up.")
+            sys.exit(1)
+        else:
+            print("Bridge is not running.")
+            sys.exit(1)
+    elif result.builtin == BuiltinCommand.BRIDGE_CONFIG:
+        from pathlib import Path as _Path
+        from platformdirs import user_config_dir as _ucd
+        _config_path = _Path(_ucd("kitty")) / "bridge.yaml"
+        from kitty.bridge.config import load_bridge_config
+        config = load_bridge_config(_config_path)
+        print(f"Host: {config.host}")
+        print(f"Port: {config.port}")
+        print(f"Profile: {config.profile or '(default)'}")
+        print(f"Keys file: {config.keys_file}")
+        print(f"Log access: {config.log_access}")
+        print(f"Log dir: {config.log_dir}")
+        print(f"TLS cert: {config.tls_cert or '(none)'}")
+        print(f"TLS key: {config.tls_key or '(none)'}")
+    elif result.builtin == BuiltinCommand.BRIDGE_INSTALL:
+        from pathlib import Path as _Path
+        from platformdirs import user_config_dir as _ucd
+        _config_path = str(_Path(_ucd("kitty")) / "bridge.yaml")
+        dry_run = "--dry-run" in result.extra_args
+        from kitty.bridge.service import generate_systemd_unit, generate_launchd_plist, generate_windows_script
+        if sys.platform == "linux":
+            content = generate_systemd_unit(executable=sys.executable, config_path=_config_path)
+            if dry_run:
+                print(content)
+            else:
+                unit_path = _Path.home() / ".config" / "systemd" / "user" / "kitty-bridge.service"
+                unit_path.parent.mkdir(parents=True, exist_ok=True)
+                unit_path.write_text(content)
+                import subprocess
+                subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+                print(f"Installed: {unit_path}")
+                print("Enable: systemctl --user enable --now kitty-bridge")
+        elif sys.platform == "darwin":
+            content = generate_launchd_plist(executable=sys.executable, config_path=_config_path)
+            if dry_run:
+                print(content)
+            else:
+                plist_path = _Path.home() / "Library" / "LaunchAgents" / "com.kitty.bridge.plist"
+                plist_path.parent.mkdir(parents=True, exist_ok=True)
+                plist_path.write_text(content)
+                print(f"Installed: {plist_path}")
+                print("Load: launchctl load " + str(plist_path))
+        else:
+            content = generate_windows_script(executable=sys.executable, config_path=_config_path)
+            if dry_run:
+                print(content)
+            else:
+                script_path = _Path("install-bridge-service.ps1")
+                script_path.write_text(content)
+                print(f"Generated {script_path}. Review and run it to install.")
+    elif result.builtin == BuiltinCommand.BRIDGE_UNINSTALL:
+        from pathlib import Path as _Path
+        import subprocess
+        if sys.platform == "linux":
+            unit_path = _Path.home() / ".config" / "systemd" / "user" / "kitty-bridge.service"
+            subprocess.run(["systemctl", "--user", "stop", "kitty-bridge"], capture_output=True)
+            subprocess.run(["systemctl", "--user", "disable", "kitty-bridge"], capture_output=True)
+            if unit_path.exists():
+                unit_path.unlink()
+                subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+                print("Uninstalled kitty-bridge service.")
+        elif sys.platform == "darwin":
+            plist_path = _Path.home() / "Library" / "LaunchAgents" / "com.kitty.bridge.plist"
+            subprocess.run(["launchctl", "unload", str(plist_path)], capture_output=True)
+            if plist_path.exists():
+                plist_path.unlink()
+                print("Uninstalled kitty-bridge service.")
+        else:
+            print("Run: nssm remove KittyBridge confirm")
     elif result.builtin == BuiltinCommand.BRIDGE:
         backend = result.backend or result.profile
         if backend is None:
@@ -193,6 +305,10 @@ def _run_bridge(
             f"Model: [cyan]{profile.model}[/cyan]\n\n"  # type: ignore[union-attr]
             f"Endpoints:\n"
             f"  • POST /v1/chat/completions\n"
+            f"  • POST /v1/messages\n"
+            f"  • POST /v1/responses\n"
+            f"  • POST /v1beta/models/{{model}}:generateContent\n"
+            f"  • GET  /v1/models\n"
             f"  • GET  /healthz\n\n"
             f"Press Ctrl+C to stop",
             title="Kitty Bridge Mode",
@@ -287,6 +403,10 @@ def _run_bridge_balancing(
             f"Members:\n{members_info}\n\n"
             f"Endpoints:\n"
             f"  • POST /v1/chat/completions\n"
+            f"  • POST /v1/messages\n"
+            f"  • POST /v1/responses\n"
+            f"  • POST /v1beta/models/{{model}}:generateContent\n"
+            f"  • GET  /v1/models\n"
             f"  • GET  /healthz\n\n"
             f"Press Ctrl+C to stop",
             title="Kitty Bridge Mode (Balancing)",

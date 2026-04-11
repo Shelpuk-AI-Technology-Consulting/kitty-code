@@ -77,20 +77,20 @@ kitty my-profile bridge
 
 ## Supported providers
 
-| Provider | Type ID | Notes |
-|----------|---------|-------|
-| Z.AI (regular) | `zai_regular` | Standard Z.AI API |
-| Z.AI (coding) | `zai_coding` | Z.AI coding-optimized endpoint |
-| MiniMax | `minimax` | |
-| Novita | `novita` | |
-| Ollama | `ollama` | Local LLM deployment (OpenAI-compatible) |
-| OpenAI | `openai` | |
-| OpenRouter | `openrouter` | Multi-provider router |
-| Fireworks | `fireworks` | Fire Pass endpoint |
-| Anthropic | `anthropic` | Direct Anthropic Messages API |
-| AWS Bedrock | `bedrock` | Uses boto3 SigV4 auth |
-| Azure OpenAI | `azure` | Azure-specific endpoint format |
-| Google Vertex AI | `vertex` | Requires project/location config |
+| Provider           | Type ID | Notes                                    |
+|--------------------|---------|------------------------------------------|
+| Z.AI (regular)     | `zai_regular` | Standard Z.AI API                        |
+| Z.AI (coding plan) | `zai_coding` | Z.AI Coding Plan endpoint      |
+| MiniMax            | `minimax` |                                          |
+| Novita             | `novita` |                                          |
+| Ollama             | `ollama` | Local LLM deployment (OpenAI-compatible) |
+| OpenAI             | `openai` |                                          |
+| OpenRouter         | `openrouter` | Multi-provider router                    |
+| Fireworks          | `fireworks` | Fire Pass endpoint                       |
+| Anthropic          | `anthropic` | Direct Anthropic Messages API            |
+| AWS Bedrock        | `bedrock` | Uses boto3 SigV4 auth                    |
+| Azure OpenAI       | `azure` | Azure-specific endpoint format           |
+| Google Vertex AI   | `vertex` | Requires project/location config         |
 
 ## How it works
 
