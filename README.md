@@ -83,6 +83,7 @@ kitty my-profile bridge
 | Z.AI (coding) | `zai_coding` | Z.AI coding-optimized endpoint |
 | MiniMax | `minimax` | |
 | Novita | `novita` | |
+| Ollama | `ollama` | Local LLM deployment (OpenAI-compatible) |
 | OpenAI | `openai` | |
 | OpenRouter | `openrouter` | Multi-provider router |
 | Fireworks | `fireworks` | Fire Pass endpoint |

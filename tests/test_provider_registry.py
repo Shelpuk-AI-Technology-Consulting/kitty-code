@@ -50,6 +50,10 @@ class TestGetProvider:
         adapter = get_provider("openai")
         assert adapter.provider_type == "openai"
 
+    def test_returns_ollama_adapter(self):
+        adapter = get_provider("ollama")
+        assert adapter.provider_type == "ollama"
+
     def test_returns_anthropic_adapter(self):
         adapter = get_provider("anthropic")
         assert adapter.provider_type == "anthropic"
