@@ -245,9 +245,6 @@ def _run_bridge_balancing(
     from kitty.tui.display import print_error
 
     # Resolve all member profiles
-    store: ProfileStore = cred_store  # type: ignore[assignment]  # We need the store — get it from the router context
-    # Actually, we need to resolve members from the store
-    from kitty.credentials.file_backend import FileBackend
     from kitty.profiles.store import ProfileStore as _PS
     profile_store = _PS()
     resolver = ProfileResolver(profile_store)
@@ -272,6 +269,7 @@ def _run_bridge_balancing(
         resolved_key=first_key,
         model=member_profiles[0].model,
         debug=debug,
+        provider_config=member_profiles[0].provider_config,
         backends=backends,
     )
 

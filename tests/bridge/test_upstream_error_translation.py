@@ -114,3 +114,47 @@ class TestTranslateUpstreamError:
         body = json.dumps({"error": {"code": "1234", "message": "Network error"}})
         result = self._call(500, body)
         assert "network" in result.lower()
+
+    def test_500_network_failure_substring_only(self):
+        """500 with network failure message but no code detected via substring."""
+        body = {"error": {"message": "Network failure, please retry later"}}
+        result = self._call(500, body)
+        assert "network" in result.lower()
+        assert "retry" in result.lower()
+
+    def test_zai_1261_on_500_returns_clear_not_network_failure(self):
+        """1261 on 500 returns /clear message, not generic network failure."""
+        body = {"error": {"code": "1261", "message": "Prompt exceeds max length"}}
+        result = self._call(500, body)
+        assert "/clear" in result
+        assert "network" not in result.lower()
+
+    def test_none_body_returns_empty_details(self):
+        """None body returns empty string."""
+        result = self._call(400, None)
+        assert result == ""
+
+    def test_extract_error_fields_dict(self):
+        """_extract_error_fields works with dict body."""
+        code, message = BridgeServer._extract_error_fields({"error": {"code": "1261", "message": "Too big"}})
+        assert code == "1261"
+        assert message == "Too big"
+
+    def test_extract_error_fields_string(self):
+        """_extract_error_fields works with JSON string body."""
+        body = json.dumps({"error": {"code": "1234", "message": "Network error"}})
+        code, message = BridgeServer._extract_error_fields(body)
+        assert code == "1234"
+        assert message == "Network error"
+
+    def test_extract_error_fields_invalid_json_string(self):
+        """_extract_error_fields returns empty for non-JSON string."""
+        code, message = BridgeServer._extract_error_fields("not json")
+        assert code == ""
+        assert message == ""
+
+    def test_extract_error_fields_none(self):
+        """_extract_error_fields returns empty for None."""
+        code, message = BridgeServer._extract_error_fields(None)
+        assert code == ""
+        assert message == ""

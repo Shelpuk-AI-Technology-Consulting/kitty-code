@@ -798,6 +798,62 @@ class TestClaudeCodeErrorHandling:
         finally:
             await server.stop_async()
 
+    @pytest.mark.asyncio
+    async def test_upstream_400_code_1261_returns_actionable_clear_message_streaming(self):
+        """Upstream Z.AI 400 code 1261 returns actionable /clear message in streaming path."""
+        server = _make_server()
+        port = await server.start_async()
+        try:
+            with aioresponses(passthrough=["http://127.0.0.1"]) as m:
+                m.post(
+                    UPSTREAM_URL,
+                    status=400,
+                    payload={"error": {"code": "1261", "message": "Prompt exceeds max length"}},
+                )
+                request = _claude_code_simple_request()
+                request["stream"] = True
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        f"http://127.0.0.1:{port}/v1/messages",
+                        json=request,
+                    ) as resp:
+                        # Bridge returns 200 with SSE error event
+                        assert resp.status == 200
+                        body = await resp.read()
+                        body_str = body.decode("utf-8")
+                        # The SSE error event should contain the actionable message
+                        assert "/clear" in body_str
+                        assert "context" in body_str.lower()
+        finally:
+            await server.stop_async()
+
+    @pytest.mark.asyncio
+    async def test_upstream_400_code_1261_returns_actionable_clear_message_non_streaming(self):
+        """Upstream Z.AI 400 code 1261 returns actionable /clear message in non-streaming path."""
+        server = _make_server()
+        port = await server.start_async()
+        try:
+            with aioresponses(passthrough=["http://127.0.0.1"]) as m:
+                m.post(
+                    UPSTREAM_URL,
+                    status=400,
+                    payload={"error": {"code": "1261", "message": "Prompt exceeds max length"}},
+                )
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        f"http://127.0.0.1:{port}/v1/messages",
+                        json=_claude_code_simple_request(),
+                    ) as resp:
+                        assert resp.status == 400
+                        data = await resp.json()
+                        assert data["type"] == "error"
+                        assert data["error"]["type"] == "api_error"
+                        msg = data["error"]["message"]
+                        assert "/clear" in msg
+                        assert "context" in msg.lower()
+        finally:
+            await server.stop_async()
+
 
 class TestClaudeCodeUpstreamRequestFormat:
     """Verify the bridge sends correctly formatted Chat Completions requests upstream."""

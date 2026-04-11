@@ -35,7 +35,7 @@ def get_provider(provider_type: str) -> ProviderAdapter:
     """Look up a provider adapter by type string.
 
     Args:
-        provider_type: One of ``"zai_regular"``, ``"zai_coding"``, ``"minimax"``, ``"novita"``, ``"openai"``, ``"openrouter"``.
+        provider_type: One of the supported provider type strings (see ``_registry`` keys).
 
     Returns:
         An instantiated ProviderAdapter.

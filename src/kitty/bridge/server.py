@@ -12,6 +12,7 @@ import aiohttp
 from aiohttp import web
 
 from kitty.bridge.gemini.translator import GeminiTranslator
+from kitty.profiles.schema import Profile
 from kitty.bridge.messages.events import format_error_event as messages_format_error
 from kitty.bridge.messages.translator import MessagesTranslator
 from kitty.bridge.responses.events import (
@@ -61,7 +62,7 @@ class BridgeServer:
         model: str | None = None,
         debug: bool = False,
         provider_config: dict | None = None,
-        backends: list[tuple[ProviderAdapter, str, object]] | None = None,
+        backends: list[tuple[ProviderAdapter, str, Profile]] | None = None,
     ) -> None:
         self._adapter = adapter
         self._provider = provider
@@ -87,25 +88,25 @@ class BridgeServer:
         self._active_model = model
         self._active_provider_config = provider_config or {}
 
-    def _get_next_backend(self) -> tuple[ProviderAdapter, str, str | None]:
+    def _get_next_backend(self) -> tuple[ProviderAdapter, str, str | None, dict]:
         """Select the next backend in round-robin order.
 
-        Returns (provider, resolved_key, model).
+        Returns (provider, resolved_key, model, provider_config).
         """
         if self._backends:
             backend = self._backends[self._backend_index % len(self._backends)]
             self._backend_index = (self._backend_index + 1) % len(self._backends)
             provider, key, profile = backend
-            return provider, key, profile.model  # type: ignore[union-attr]
-        return self._provider, self._resolved_key, self._model
+            return provider, key, profile.model, profile.provider_config  # type: ignore[union-attr]
+        return self._provider, self._resolved_key, self._model, self._provider_config or {}
 
     def _select_backend(self) -> None:
         """Select next backend and set active fields for the current request."""
-        provider, key, model = self._get_next_backend()
+        provider, key, model, provider_config = self._get_next_backend()
         self._active_provider = provider
         self._active_key = key
         self._active_model = model
-        self._active_provider_config = getattr(self, "_provider_config", {}) if not self._backends else {}
+        self._active_provider_config = provider_config
 
     @property
     def port(self) -> int:
@@ -248,8 +249,9 @@ class BridgeServer:
         try:
             cc_response = await self._make_upstream_request(cc_request)
         except UpstreamError as exc:
+            error_msg = self._translate_upstream_error(exc.status, exc.body)
             return web.json_response(
-                {"error": {"code": "upstream_error", "message": str(exc)}},
+                {"error": {"code": "upstream_error", "message": error_msg}},
                 status=exc.status,
             )
         except Exception as exc:
@@ -317,8 +319,9 @@ class BridgeServer:
                             continue
 
                         terminal_status = "incomplete"
+                        error_msg = self._translate_upstream_error(upstream.status, error_body)
                         error_event = responses_format_error(
-                            {"code": "upstream_error", "message": error_body},
+                            {"code": "upstream_error", "message": error_msg},
                             seq=translator._next_seq(),
                         )
                         await sr.write(error_event.encode())
@@ -654,8 +657,9 @@ class BridgeServer:
         try:
             cc_response = await self._make_upstream_request(cc_request)
         except UpstreamError as exc:
+            error_msg = self._translate_upstream_error(exc.status, exc.body)
             return web.json_response(
-                {"error": {"code": exc.status, "message": str(exc)}},
+                {"error": {"code": exc.status, "message": error_msg}},
                 status=exc.status,
             )
         except Exception as exc:
@@ -712,7 +716,8 @@ class BridgeServer:
                             await asyncio.sleep(delay)
                             continue
 
-                        error_sse = f"data: {json.dumps({'error': {'code': upstream.status, 'message': error_body}})}\n\n"
+                        error_msg = self._translate_upstream_error(upstream.status, error_body)
+                        error_sse = f"data: {json.dumps({'error': {'code': upstream.status, 'message': error_msg}})}\n\n"
                         try:
                             await sr.write(error_sse.encode())
                         except (ConnectionResetError, BrokenPipeError, OSError):
@@ -821,8 +826,9 @@ class BridgeServer:
         try:
             cc_response = await self._make_upstream_request(cc_request)
         except UpstreamError as exc:
+            error_msg = self._translate_upstream_error(exc.status, exc.body)
             return web.json_response(
-                {"error": {"message": str(exc), "type": "upstream_error"}},
+                {"error": {"message": error_msg, "type": "upstream_error"}},
                 status=exc.status,
             )
         except Exception as exc:
@@ -879,7 +885,8 @@ class BridgeServer:
                             await asyncio.sleep(delay)
                             continue
 
-                        error_sse = f"data: {json.dumps({'error': {'message': error_body, 'type': 'upstream_error'}})}\n\n"
+                        error_msg = self._translate_upstream_error(upstream.status, error_body)
+                        error_sse = f"data: {json.dumps({'error': {'message': error_msg, 'type': 'upstream_error'}})}\n\n"
                         try:
                             await sr.write(error_sse.encode())
                         except (ConnectionResetError, BrokenPipeError, OSError):
@@ -983,6 +990,33 @@ class BridgeServer:
 
 
     @staticmethod
+    def _extract_error_fields(body: object) -> tuple[str, str]:
+        """Extract (code, message) from an upstream error body.
+
+        Handles both dict bodies (from non-streaming path) and raw JSON
+        strings (from streaming path).
+        """
+        error_obj: dict | None = None
+        if isinstance(body, dict):
+            error_obj = body.get("error")
+        elif isinstance(body, str):
+            try:
+                parsed = json.loads(body)
+                if isinstance(parsed, dict):
+                    error_obj = parsed.get("error")
+            except json.JSONDecodeError:
+                pass
+
+        code = ""
+        message = ""
+        if isinstance(error_obj, dict):
+            if error_obj.get("code") is not None:
+                code = str(error_obj.get("code"))
+            if error_obj.get("message") is not None:
+                message = str(error_obj.get("message"))
+        return code, message
+
+    @staticmethod
     def _translate_upstream_error(status: int, body: object) -> str:
         """Translate an upstream HTTP error into a user-friendly message.
 
@@ -1003,30 +1037,24 @@ class BridgeServer:
                 "Update your API key with 'kitty setup'."
             )
 
-        if status == 500:
-            code = ""
-            error_message = ""
-            if isinstance(body, dict):
-                error_obj = body.get("error")
-                if isinstance(error_obj, dict):
-                    if error_obj.get("code") is not None:
-                        code = str(error_obj.get("code"))
-                    if error_obj.get("message") is not None:
-                        error_message = str(error_obj.get("message"))
-            else:
-                try:
-                    parsed = json.loads(details)
-                except Exception:
-                    parsed = None
-                if isinstance(parsed, dict):
-                    error_obj = parsed.get("error")
-                    if isinstance(error_obj, dict):
-                        if error_obj.get("code") is not None:
-                            code = str(error_obj.get("code"))
-                        if error_obj.get("message") is not None:
-                            error_message = str(error_obj.get("message"))
+        code, error_message = BridgeServer._extract_error_fields(body)
 
-            searchable = f"{details}\n{error_message}".lower()
+        # Z.AI code 1261: prompt exceeds model context window
+        searchable = f"{details}\n{error_message}".lower()
+        is_context_too_large = (
+            code == "1261"
+            or "exceeds max length" in searchable
+            or "prompt exceeds" in searchable
+            or "context length" in searchable
+            or "maximum context" in searchable
+        )
+        if is_context_too_large:
+            return (
+                "The conversation context has grown too large for the upstream model's context window. "
+                "Use /clear to reset the conversation context."
+            )
+
+        if status == 500:
             is_provider_network_failure = code == "1234" or "network failure" in searchable
             if is_provider_network_failure:
                 prefix = (

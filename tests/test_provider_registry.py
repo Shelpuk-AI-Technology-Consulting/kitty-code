@@ -1,8 +1,24 @@
 """Tests for providers/registry.py — get_provider lookup."""
 
+from typing import get_args
+
 import pytest
 
-from kitty.providers.registry import get_provider
+from kitty.profiles.schema import _PROVIDER_TYPES
+from kitty.providers.registry import _registry, get_provider
+
+
+class TestProviderRegistrySync:
+    """Cross-module consistency: _PROVIDER_TYPES Literal must match _registry keys."""
+
+    def test_provider_literal_matches_registry(self):
+        """_PROVIDER_TYPES in schema.py must match _registry keys in registry.py."""
+        literal_values = set(get_args(_PROVIDER_TYPES))
+        registry_keys = set(_registry.keys())
+        assert literal_values == registry_keys, (
+            f"Mismatch: Literal has {literal_values - registry_keys} extra, "
+            f"registry has {registry_keys - literal_values} extra"
+        )
 
 
 class TestGetProvider:
@@ -53,7 +69,3 @@ class TestGetProvider:
     def test_returns_fireworks_adapter(self):
         adapter = get_provider("fireworks")
         assert adapter.provider_type == "fireworks"
-
-    def test_returns_ollama_adapter(self):
-        adapter = get_provider("ollama")
-        assert adapter.provider_type == "ollama"

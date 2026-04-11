@@ -179,12 +179,15 @@ def _create_balancing_flow(store: ProfileStore) -> BalancingProfile:
     names = [p.name for p in profiles]
     selected: list[str] = []
     print_section("Select member profiles (at least 2)")
-    while len(selected) < 2:
+    while True:
         remaining = [n for n in names if n not in selected]
         if not remaining:
             break
         label = f"Add profile ({len(selected)} selected)" if selected else "Add first profile"
-        menu = SelectionMenu(label, remaining + ["Done"])
+        options = remaining[:]
+        if len(selected) >= 2:
+            options.append("Done")
+        menu = SelectionMenu(label, options)
         choice = menu.show()
         if choice is None or choice == "Done":
             break
@@ -237,6 +240,18 @@ def _delete_profile_flow(store: ProfileStore) -> None:
     menu = SelectionMenu("Select profile to delete", names)
     selected = menu.show()
     if selected is None:
+        return
+
+    # Check if any balancing profiles reference this one
+    referencing = [
+        b.name for b in backends
+        if isinstance(b, BalancingProfile) and selected in b.members
+    ]
+    if referencing:
+        print_error(
+            f"Cannot delete {selected!r} — it is a member of balancing profile(s): "
+            f"{', '.join(referencing)}. Remove it from those profiles first."
+        )
         return
 
     if prompt_confirm(f"Delete profile {selected!r}?", default=False):

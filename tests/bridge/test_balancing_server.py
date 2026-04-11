@@ -130,7 +130,7 @@ class TestRoundRobinSelection:
             model="single-model",
         )
         # _get_next_backend should return the single-profile tuple
-        p, key, model = server._get_next_backend()
+        p, key, model, config = server._get_next_backend()
         assert key == "single-key"
         assert model == "single-model"
 
@@ -142,7 +142,7 @@ class TestRoundRobinSelection:
             provider=provider,
             resolved_key="single-key",
         )
-        p, key, model = server._get_next_backend()
+        p, key, model, config = server._get_next_backend()
         assert key == "single-key"
         assert model is None
 
@@ -216,3 +216,57 @@ class TestRoundRobinIntegration:
                     assert resp.status == 200
 
         await server.stop_async()
+
+
+class TestProviderConfigPropagation:
+    def test_provider_config_per_backend(self):
+        """Each backend's provider_config is correctly set as _active_provider_config."""
+        from kitty.profiles.schema import Profile
+        import uuid
+
+        backends = []
+        for i in range(3):
+            provider = StubProvider(provider_type=f"stub-{i}", base_url=f"https://api{i}.example.com/v1")
+            profile = Profile(
+                name=f"profile-{i}",
+                provider="openai",
+                model=f"model-{i}",
+                auth_ref=str(uuid.uuid4()),
+                provider_config={"custom_url": f"https://custom{i}.example.com"},
+            )
+            backends.append((provider, f"key-{i}", profile))
+
+        server = BridgeServer(
+            adapter=StubLauncher(),
+            provider=backends[0][0],
+            resolved_key=backends[0][1],
+            model="model-0",
+            backends=backends,
+        )
+
+        # First backend → first provider_config
+        server._select_backend()
+        assert server._active_provider_config == {"custom_url": "https://custom0.example.com"}
+
+        # Second backend → second provider_config
+        server._select_backend()
+        assert server._active_provider_config == {"custom_url": "https://custom1.example.com"}
+
+        # Third backend → third provider_config
+        server._select_backend()
+        assert server._active_provider_config == {"custom_url": "https://custom2.example.com"}
+
+    def test_single_profile_uses_init_provider_config(self):
+        """Without backends, _active_provider_config uses the init parameter."""
+        provider = StubProvider()
+        config = {"base_url": "https://custom.example.com"}
+        server = BridgeServer(
+            adapter=StubLauncher(),
+            provider=provider,
+            resolved_key="single-key",
+            model="single-model",
+            provider_config=config,
+        )
+
+        server._select_backend()
+        assert server._active_provider_config == config
