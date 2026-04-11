@@ -55,7 +55,7 @@ async def validate_api_key(
 
     provider_config = provider_config or {}
     base_url = provider.build_base_url(provider_config).rstrip("/")
-    model = provider.normalize_model_name("test")
+    model = provider.normalize_model_name(provider.validation_model)
     path = provider.get_upstream_path(model)
     url = f"{base_url}{path}"
     headers = provider.build_upstream_headers(api_key)

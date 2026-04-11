@@ -65,6 +65,7 @@ def run_setup_wizard(store: ProfileStore, cred_store: CredentialStore) -> Profil
             "bedrock",
             "azure",
             "vertex",
+            "opencode_go",
         ],
     )
     provider = provider_menu.show()

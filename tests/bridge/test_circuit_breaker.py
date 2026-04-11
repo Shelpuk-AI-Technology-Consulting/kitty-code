@@ -140,7 +140,7 @@ class TestGetNextBackendHealthAware:
         # Should cycle through 0 and 2 only
         keys = []
         for _ in range(4):
-            _, key, _, _ = server._get_next_backend()
+            _, key, _, _, _ = server._get_next_backend()
             keys.append(key)
         assert keys == ["key-0", "key-2", "key-0", "key-2"]
 
@@ -151,7 +151,7 @@ class TestGetNextBackendHealthAware:
         # With cooldown=0, backend should recover immediately
         keys = []
         for _ in range(6):
-            _, key, _, _ = server._get_next_backend()
+            _, key, _, _, _ = server._get_next_backend()
             keys.append(key)
         # All three backends should be used
         assert "key-0" in keys
@@ -164,7 +164,7 @@ class TestGetNextBackendHealthAware:
 
         keys = []
         for _ in range(4):
-            _, key, _, _ = server._get_next_backend()
+            _, key, _, _, _ = server._get_next_backend()
             keys.append(key)
         assert "key-1" not in keys
 
@@ -174,7 +174,7 @@ class TestGetNextBackendHealthAware:
         server._mark_backend_unhealthy(0)
         server._mark_backend_unhealthy(1)
 
-        _, key, _, _ = server._get_next_backend()
+        _, key, _, _, _ = server._get_next_backend()
         assert key in ("key-0", "key-1")
 
     def test_non_balancing_unaffected(self):
@@ -185,7 +185,7 @@ class TestGetNextBackendHealthAware:
             resolved_key="single-key",
             model="single-model",
         )
-        _, key, model, _ = server._get_next_backend()
+        _, key, model, _, _ = server._get_next_backend()
         assert key == "single-key"
         assert model == "single-model"
 

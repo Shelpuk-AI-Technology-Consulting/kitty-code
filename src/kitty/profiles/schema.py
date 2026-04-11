@@ -28,6 +28,7 @@ _PROVIDER_TYPES = Literal[
     "azure",
     "vertex",
     "fireworks",
+    "opencode_go",
 ]
 
 

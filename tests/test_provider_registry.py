@@ -73,3 +73,7 @@ class TestGetProvider:
     def test_returns_fireworks_adapter(self):
         adapter = get_provider("fireworks")
         assert adapter.provider_type == "fireworks"
+
+    def test_returns_opencode_go_adapter(self):
+        adapter = get_provider("opencode_go")
+        assert adapter.provider_type == "opencode_go"

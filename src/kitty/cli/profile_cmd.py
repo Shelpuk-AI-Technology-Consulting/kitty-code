@@ -124,6 +124,7 @@ def _create_profile_flow(store: ProfileStore, cred_store: CredentialStore) -> Pr
             "bedrock",
             "azure",
             "vertex",
+            "opencode_go",
         ],
     )
     provider = provider_menu.show()

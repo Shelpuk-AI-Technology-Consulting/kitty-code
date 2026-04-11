@@ -165,6 +165,16 @@ class ProviderAdapter(ABC):
     # ── Custom transport ─────────────────────────────────────────────────
 
     @property
+    def validation_model(self) -> str:
+        """Model name used for API key validation.
+
+        Override in providers that require a specific model name for the
+        validation request to succeed (e.g. providers that reject unknown
+        models with 401 instead of 400).
+        """
+        return "test"
+
+    @property
     def use_custom_transport(self) -> bool:
         """Whether this provider handles its own HTTP transport.
 

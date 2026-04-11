@@ -128,7 +128,7 @@ class TestRoundRobinSelection:
             model="single-model",
         )
         # _get_next_backend should return the single-profile tuple
-        p, key, model, config = server._get_next_backend()
+        p, key, model, config, _idx = server._get_next_backend()
         assert key == "single-key"
         assert model == "single-model"
 
@@ -140,7 +140,7 @@ class TestRoundRobinSelection:
             provider=provider,
             resolved_key="single-key",
         )
-        p, key, model, config = server._get_next_backend()
+        p, key, model, config, _idx = server._get_next_backend()
         assert key == "single-key"
         assert model is None
 
