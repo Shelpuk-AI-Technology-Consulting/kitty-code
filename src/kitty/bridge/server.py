@@ -817,15 +817,92 @@ class BridgeServer:
             n_backends = len(self._backends) if self._backends else 1
             max_attempts = (_MAX_RETRIES + 1) * n_backends
             for attempt in range(max_attempts):
-                async with session.post(url, json=upstream_body, headers=headers, timeout=stream_timeout) as upstream:
-                    logger.debug("Upstream response status: %d", upstream.status)
+                try:
+                    async with session.post(
+                        url,
+                        json=upstream_body,
+                        headers=headers,
+                        timeout=stream_timeout,
+                    ) as upstream:
+                        logger.debug("Upstream response status: %d", upstream.status)
 
-                    if upstream.status not in (200, 201):
-                        error_body = await upstream.text()
-                        logger.error("Upstream error %d: %s", upstream.status, error_body)
+                        if upstream.status not in (200, 201):
+                            error_body = await upstream.text()
+                            logger.error("Upstream error %d: %s", upstream.status, error_body)
 
-                        if upstream.status in _RETRYABLE_STATUSES and attempt < max_attempts - 1:
-                            # Mark backend unhealthy if in balancing mode
+                            if upstream.status in _RETRYABLE_STATUSES and attempt < max_attempts - 1:
+                                # Mark backend unhealthy if in balancing mode
+                                if self._backends and self._current_backend_idx >= 0:
+                                    self._mark_backend_unhealthy(self._current_backend_idx)
+                                    self._select_backend()
+                                    url = self._build_upstream_url()
+                                    headers = self._build_upstream_headers()
+                                    upstream_body = self._active_provider.translate_to_upstream(cc_request)
+                                    logger.info(
+                                        "Streaming failover: backend attempt %d/%d (status %d), switching backend",
+                                        attempt + 1,
+                                        max_attempts,
+                                        upstream.status,
+                                    )
+                                else:
+                                    delay = _BACKOFF_BASE * (2 ** (attempt % (_MAX_RETRIES + 1)))
+                                    await asyncio.sleep(delay)
+                                continue
+
+                            error_msg = self._translate_upstream_error(upstream.status, error_body)
+                            error_event = messages_format_error(
+                                {"type": "error", "error": {"type": "api_error", "message": error_msg}},
+                            )
+                            await sr.write(error_event.encode())
+                            break
+
+                        # Success path — stream the response
+                        line_buffer = ""
+                        done = False
+                        chunk_count = 0
+                        async for chunk_bytes in upstream.content:
+                            if done:
+                                break
+                            chunk_count += 1
+                            line_buffer += chunk_bytes.decode("utf-8", errors="replace")
+                            while "\n" in line_buffer:
+                                line, line_buffer = line_buffer.split("\n", 1)
+                                line = line.rstrip("\r")
+                                if not line:
+                                    continue
+                                if line.startswith("data: "):
+                                    data_str = line[6:]
+                                    if data_str.strip() == "[DONE]":
+                                        done = True
+                                        break
+                                    try:
+                                        chunk = json.loads(data_str)
+                                    except json.JSONDecodeError:
+                                        logger.warning("Failed to parse upstream SSE data: %s", data_str[:200])
+                                        continue
+                                    events = translator.translate_stream_chunk(message_id, model, chunk)
+                                    for event in events:
+                                        await sr.write(event.encode())
+
+                        logger.debug("Upstream stream ended. chunks=%d done=%s", chunk_count, done)
+
+                        # Flush remaining buffer (last chunk without trailing \n)
+                        if not done and line_buffer.strip():
+                            line = line_buffer.strip()
+                            if line.startswith("data: "):
+                                data_str = line[6:]
+                                if data_str.strip() != "[DONE]":
+                                    try:
+                                        chunk = json.loads(data_str)
+                                        events = translator.translate_stream_chunk(message_id, model, chunk)
+                                        for event in events:
+                                            await sr.write(event.encode())
+                                    except json.JSONDecodeError:
+                                        logger.warning("Failed to parse flushed SSE data: %s", data_str[:200])
+                        break  # Exit retry loop on success
+                except Exception as exc:
+                    if _is_retryable_exception(exc):
+                        if attempt < max_attempts - 1:
                             if self._backends and self._current_backend_idx >= 0:
                                 self._mark_backend_unhealthy(self._current_backend_idx)
                                 self._select_backend()
@@ -833,67 +910,48 @@ class BridgeServer:
                                 headers = self._build_upstream_headers()
                                 upstream_body = self._active_provider.translate_to_upstream(cc_request)
                                 logger.info(
-                                    "Streaming failover: backend attempt %d/%d (status %d), switching backend",
+                                    "Streaming failover: backend attempt %d/%d failed (%s), switching backend",
                                     attempt + 1,
                                     max_attempts,
-                                    upstream.status,
+                                    type(exc).__name__,
                                 )
                             else:
                                 delay = _BACKOFF_BASE * (2 ** (attempt % (_MAX_RETRIES + 1)))
+                                logger.warning(
+                                    "Upstream request failed (%s), retrying in %.1fs (%d/%d)",
+                                    type(exc).__name__,
+                                    delay,
+                                    attempt + 1,
+                                    max_attempts - 1,
+                                )
                                 await asyncio.sleep(delay)
                             continue
 
-                        error_msg = self._translate_upstream_error(upstream.status, error_body)
+                        if isinstance(exc, asyncio.TimeoutError):
+                            logger.error("Upstream POST timed out after %ds for %s", _STREAM_READ_TIMEOUT, message_id)
+                            error_msg = (
+                                f"Upstream provider timed out ({_STREAM_READ_TIMEOUT}s). "
+                                "Try /clear to reduce context size."
+                            )
+                        else:
+                            logger.error(
+                                "Upstream POST failed after %d attempts for %s: %s",
+                                max_attempts,
+                                message_id,
+                                exc,
+                            )
+                            error_msg = str(exc) or "Upstream provider request failed"
+
                         error_event = messages_format_error(
                             {"type": "error", "error": {"type": "api_error", "message": error_msg}},
                         )
-                        await sr.write(error_event.encode())
+                        try:
+                            await sr.write(error_event.encode())
+                        except (ConnectionResetError, BrokenPipeError, OSError):
+                            logger.debug("Client disconnected before error could be sent for %s", message_id)
                         break
 
-                    # Success path — stream the response
-                    line_buffer = ""
-                    done = False
-                    chunk_count = 0
-                    async for chunk_bytes in upstream.content:
-                        if done:
-                            break
-                        chunk_count += 1
-                        line_buffer += chunk_bytes.decode("utf-8", errors="replace")
-                        while "\n" in line_buffer:
-                            line, line_buffer = line_buffer.split("\n", 1)
-                            line = line.rstrip("\r")
-                            if not line:
-                                continue
-                            if line.startswith("data: "):
-                                data_str = line[6:]
-                                if data_str.strip() == "[DONE]":
-                                    done = True
-                                    break
-                                try:
-                                    chunk = json.loads(data_str)
-                                except json.JSONDecodeError:
-                                    logger.warning("Failed to parse upstream SSE data: %s", data_str[:200])
-                                    continue
-                                events = translator.translate_stream_chunk(message_id, model, chunk)
-                                for event in events:
-                                    await sr.write(event.encode())
-
-                    logger.debug("Upstream stream ended. chunks=%d done=%s", chunk_count, done)
-
-                    # Flush remaining buffer (last chunk without trailing \n)
-                    if not done and line_buffer.strip():
-                        line = line_buffer.strip()
-                        if line.startswith("data: "):
-                            data_str = line[6:]
-                            if data_str.strip() != "[DONE]":
-                                try:
-                                    chunk = json.loads(data_str)
-                                    events = translator.translate_stream_chunk(message_id, model, chunk)
-                                    for event in events:
-                                        await sr.write(event.encode())
-                                except json.JSONDecodeError:
-                                    logger.warning("Failed to parse flushed SSE data: %s", data_str[:200])
-                    break  # Exit retry loop on success
+                    raise
 
         except asyncio.TimeoutError:
             logger.error("Upstream POST timed out after %ds for %s", _STREAM_READ_TIMEOUT, message_id)

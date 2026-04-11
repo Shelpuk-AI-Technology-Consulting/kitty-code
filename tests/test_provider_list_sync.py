@@ -2,26 +2,43 @@
 
 from __future__ import annotations
 
+from unittest.mock import MagicMock
+
+import pytest
+
 from kitty.cli.profile_cmd import _create_profile_flow
 from kitty.cli.setup_cmd import run_setup_wizard
 from kitty.providers.registry import _registry
 
 
-def test_setup_cmd_includes_all_registered_providers() -> None:
+class _StopFlow(Exception):
+    """Raised by test doubles to stop interactive flow after capturing menu options."""
+
+
+def _capture_provider_options(monkeypatch: pytest.MonkeyPatch, module_prefix: str) -> list[str]:
+    captured: list[str] = []
+
+    class FakeSelectionMenu:
+        def __init__(self, title: str, options: list[str]) -> None:
+            assert title == "Select provider"
+            captured.extend(options)
+
+        def show(self) -> str:
+            raise _StopFlow
+
+    monkeypatch.setattr(f"{module_prefix}.SelectionMenu", FakeSelectionMenu)
+    return captured
+
+
+def test_setup_cmd_includes_all_registered_providers(monkeypatch: pytest.MonkeyPatch) -> None:
     """Setup wizard provider list must include all providers from registry."""
-    # Extract provider list from setup_cmd source
-    import inspect
+    captured = _capture_provider_options(monkeypatch, "kitty.cli.setup_cmd")
+    monkeypatch.setattr("kitty.cli.setup_cmd._check_tty", lambda: None)
 
-    source = inspect.getsource(run_setup_wizard)
-    # Find the provider list in the SelectionMenu call
-    import re
+    with pytest.raises(_StopFlow):
+        run_setup_wizard(store=MagicMock(), cred_store=MagicMock())
 
-    match = re.search(r'SelectionMenu\("Select provider",\s*\[(.*?)\]\)', source, re.DOTALL)
-    assert match is not None, "Could not find provider list in setup_cmd.py"
-
-    list_str = match.group(1)
-    # Extract quoted strings
-    providers_in_ui = set(re.findall(r'"([^"]+)"', list_str))
+    providers_in_ui = set(captured)
     providers_in_registry = set(_registry.keys())
 
     missing_in_ui = providers_in_registry - providers_in_ui
@@ -31,17 +48,14 @@ def test_setup_cmd_includes_all_registered_providers() -> None:
     assert not extra_in_ui, f"Extra providers in setup_cmd.py TUI (not in registry): {extra_in_ui}"
 
 
-def test_profile_cmd_includes_all_registered_providers() -> None:
+def test_profile_cmd_includes_all_registered_providers(monkeypatch: pytest.MonkeyPatch) -> None:
     """Profile command provider list must include all providers from registry."""
-    import inspect
-    import re
+    captured = _capture_provider_options(monkeypatch, "kitty.cli.profile_cmd")
 
-    source = inspect.getsource(_create_profile_flow)
-    match = re.search(r'SelectionMenu\("Select provider",\s*\[(.*?)\]\)', source, re.DOTALL)
-    assert match is not None, "Could not find provider list in profile_cmd.py"
+    with pytest.raises(_StopFlow):
+        _create_profile_flow(store=MagicMock(), cred_store=MagicMock())
 
-    list_str = match.group(1)
-    providers_in_ui = set(re.findall(r'"([^"]+)"', list_str))
+    providers_in_ui = set(captured)
     providers_in_registry = set(_registry.keys())
 
     missing_in_ui = providers_in_registry - providers_in_ui

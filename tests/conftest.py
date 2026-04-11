@@ -6,6 +6,27 @@ from pathlib import Path
 import pytest
 
 
+def pytest_addoption(parser: pytest.Parser) -> None:
+    """Add CLI flag to include slow tests."""
+    parser.addoption("--runslow", action="store_true", default=False, help="run tests marked as slow")
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Register custom markers used by the suite."""
+    config.addinivalue_line("markers", "slow: mark test as slow to run")
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    """Skip slow tests unless explicitly requested."""
+    if config.getoption("--runslow"):
+        return
+
+    skip_slow = pytest.mark.skip(reason="need --runslow option to run")
+    for item in items:
+        if "slow" in item.keywords:
+            item.add_marker(skip_slow)
+
+
 @pytest.fixture()
 def tmp_dir(tmp_path: Path) -> Path:
     """Temporary directory for profile/credential stores."""
