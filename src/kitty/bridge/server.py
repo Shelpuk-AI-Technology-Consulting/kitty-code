@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import random
 import logging
 import ssl
 import time
@@ -138,7 +139,7 @@ class BridgeServer:
 
         # Balancing mode: list of (provider, resolved_key, profile) tuples
         self._backends = backends
-        self._backend_index = 0
+
         self._backend_cooldown = backend_cooldown
 
         # Backend health tracking (parallel to _backends)
@@ -156,29 +157,24 @@ class BridgeServer:
         self._current_backend_idx: int = -1
 
     def _get_next_backend(self) -> tuple[ProviderAdapter, str, str | None, dict]:
-        """Select the next healthy backend in round-robin order.
+        """Select a healthy backend at random with equal probability.
 
         Skips backends that are in cooldown (unhealthy). If all backends
-        are unhealthy, returns the next one anyway (let it fail naturally).
+        are unhealthy, returns a random one anyway (let it fail naturally).
 
         Returns (provider, resolved_key, model, provider_config, backend_index).
         backend_index is -1 for non-balancing mode.
         """
         if self._backends:
             n = len(self._backends)
-            # Try all backends to find a healthy one
-            for _ in range(n):
-                idx = self._backend_index % n
-                self._backend_index = (self._backend_index + 1) % n
 
+            # Check which backends are currently healthy (or cooldown expired)
+            healthy_indices = []
+            for idx in range(n):
                 health = self._backend_health[idx]
                 if health["healthy"]:
-                    backend = self._backends[idx]
-                    provider, key, profile = backend
-                    return provider, key, profile.model, profile.provider_config, idx  # type: ignore[union-attr]
-
-                # Check if cooldown has expired
-                if health["failed_at"] is not None:
+                    healthy_indices.append(idx)
+                elif health["failed_at"] is not None:
                     elapsed = time.monotonic() - health["failed_at"]
                     if elapsed >= health["cooldown"]:
                         logger.info(
@@ -188,14 +184,17 @@ class BridgeServer:
                         )
                         health["healthy"] = True
                         health["failed_at"] = None
-                        backend = self._backends[idx]
-                        provider, key, profile = backend
-                        return provider, key, profile.model, profile.provider_config, idx  # type: ignore[union-attr]
+                        healthy_indices.append(idx)
 
-            # All backends unhealthy — return next one anyway
+            if healthy_indices:
+                idx = random.choice(healthy_indices)
+                backend = self._backends[idx]
+                provider, key, profile = backend
+                return provider, key, profile.model, profile.provider_config, idx  # type: ignore[union-attr]
+
+            # All backends unhealthy — return a random one anyway
             logger.warning("All %d backends unhealthy, attempting request anyway", n)
-            idx = self._backend_index % n
-            self._backend_index = (self._backend_index + 1) % n
+            idx = random.randint(0, n - 1)
             backend = self._backends[idx]
             provider, key, profile = backend
             return provider, key, profile.model, profile.provider_config, idx  # type: ignore[union-attr]
@@ -620,7 +619,6 @@ class BridgeServer:
 
                     if upstream.status not in (200, 201):
                         error_body = await upstream.text()
-                        logger.error("Upstream error %d: %s", upstream.status, error_body)
 
                         # In balancing mode: mark unhealthy, try next backend
                         if self._backends and self._current_backend_idx >= 0:
@@ -652,6 +650,7 @@ class BridgeServer:
                             continue
 
                         # No healthy backends left or non-balancing mode — surface error to agent
+                        logger.error("Upstream error %d: %s", upstream.status, error_body)
                         terminal_status = "incomplete"
                         error_msg = self._translate_upstream_error(upstream.status, error_body)
                         error_event = responses_format_error(
@@ -900,7 +899,6 @@ class BridgeServer:
 
                         if upstream.status not in (200, 201):
                             error_body = await upstream.text()
-                            logger.error("Upstream error %d: %s", upstream.status, error_body)
 
                             retryable = self._should_retry_stream(upstream.status, error_body)
                             # In balancing mode: mark unhealthy and try next backend for ANY error
@@ -927,6 +925,7 @@ class BridgeServer:
                                 continue
 
                             # All backends exhausted or non-balancing mode — surface error to agent
+                            logger.error("Upstream error %d: %s", upstream.status, error_body)
                             error_msg = self._translate_upstream_error(upstream.status, error_body)
                             error_event = messages_format_error(
                                 {"type": "error", "error": {"type": "api_error", "message": error_msg}},

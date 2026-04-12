@@ -124,7 +124,7 @@ The server exposes:
 
 ### Balancing profiles
 
-Balancing profiles distribute LLM calls across multiple providers in round-robin order:
+Balancing profiles distribute LLM calls across multiple providers using random selection across healthy members:
 
 ```bash
 # Create a balancing profile via the profile menu
@@ -136,7 +136,7 @@ kitty my-balancer codex
 kitty my-balancer bridge
 ```
 
-Each request is routed to the next provider in the rotation. Useful for cost optimization, rate limit distribution, and resilience across multiple providers.
+Each request is routed to a randomly selected healthy provider member. Useful for cost optimization, rate limit distribution, and resilience across multiple providers.
 
 ## Profiles
 
@@ -154,7 +154,7 @@ kitty my-profile claude
 kitty profile  # → "Set default profile"
 ```
 
-A **balancing profile** is a list of regular profiles. Requests are round-robined across members.
+A **balancing profile** is a list of regular profiles. Requests are distributed by random healthy-member selection.
 
 ## Pre-flight validation
 
@@ -183,7 +183,7 @@ kitty cleanup
 ```
 src/kitty/
 ├── bridge/          # HTTP bridge server + protocol translation
-│   ├── server.py    # aiohttp-based bridge with round-robin balancing
+│   ├── server.py    # aiohttp-based bridge with random healthy-backend balancing
 │   ├── engine.py    # Shared translation primitives
 │   ├── responses/   # Responses API translation (Codex)
 │   ├── messages/    # Messages API translation (Claude Code)

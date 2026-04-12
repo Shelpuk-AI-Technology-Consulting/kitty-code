@@ -373,7 +373,7 @@ def _run_bridge_balancing(
     debug: bool = False,
     validate: bool = True,
 ) -> None:
-    """Run bridge mode with a balancing profile — round-robin across member profiles."""
+    """Run bridge mode with a balancing profile — random selection across healthy members."""
     import asyncio
     import signal
     import sys
@@ -496,7 +496,7 @@ def _launch_target_balancing(
     debug: bool = False,
     validate: bool = True,
 ) -> int:
-    """Launch a coding agent with a balancing profile (round-robin across members)."""
+    """Launch a coding agent with a balancing profile (random healthy member selection)."""
     from kitty.cli.launcher import launch
     from kitty.profiles.resolver import ProfileResolver
     from kitty.profiles.store import ProfileStore

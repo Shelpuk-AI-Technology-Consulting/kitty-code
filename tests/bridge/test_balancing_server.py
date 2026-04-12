@@ -1,4 +1,6 @@
-"""Tests for bridge server round-robin balancing — backend selection per request."""
+"""Tests for bridge server random balancing — backend selection per request."""
+
+import random
 
 import aiohttp
 import pytest
@@ -75,8 +77,8 @@ def _make_backends(n: int):
     return backends
 
 
-class TestRoundRobinSelection:
-    def test_single_backend_cycles_to_same(self):
+class TestRandomSelection:
+    def test_single_backend_always_returns_same(self):
         """With one backend, _get_next_backend always returns the same."""
         backends = _make_backends(1)
         server = BridgeServer(
@@ -86,26 +88,12 @@ class TestRoundRobinSelection:
             model="model-0",
             backends=backends,
         )
-        first = server._get_next_backend()
-        second = server._get_next_backend()
-        assert first[1] == "key-0"
-        assert second[1] == "key-0"
+        random.seed(42)
+        results = [server._get_next_backend()[1] for _ in range(10)]
+        assert all(k == "key-0" for k in results)
 
-    def test_two_backends_round_robin(self):
-        """With two backends, alternates between them."""
-        backends = _make_backends(2)
-        server = BridgeServer(
-            adapter=StubLauncher(),
-            provider=backends[0][0],
-            resolved_key=backends[0][1],
-            model="model-0",
-            backends=backends,
-        )
-        results = [server._get_next_backend() for _ in range(4)]
-        keys = [r[1] for r in results]
-        assert keys == ["key-0", "key-1", "key-0", "key-1"]
-
-    def test_three_backends_round_robin(self):
+    def test_multiple_backends_all_selected(self):
+        """With multiple backends, random selection should hit all of them."""
         backends = _make_backends(3)
         server = BridgeServer(
             adapter=StubLauncher(),
@@ -114,9 +102,9 @@ class TestRoundRobinSelection:
             model="model-0",
             backends=backends,
         )
-        results = [server._get_next_backend() for _ in range(6)]
-        keys = [r[1] for r in results]
-        assert keys == ["key-0", "key-1", "key-2", "key-0", "key-1", "key-2"]
+        random.seed(42)
+        results = {server._get_next_backend()[1] for _ in range(100)}
+        assert results == {"key-0", "key-1", "key-2"}
 
     def test_no_backends_uses_single_profile(self):
         """When backends is None, falls back to single profile mode."""
@@ -127,7 +115,6 @@ class TestRoundRobinSelection:
             resolved_key="single-key",
             model="single-model",
         )
-        # _get_next_backend should return the single-profile tuple
         p, key, model, config, _idx = server._get_next_backend()
         assert key == "single-key"
         assert model == "single-model"
@@ -145,10 +132,10 @@ class TestRoundRobinSelection:
         assert model is None
 
 
-class TestRoundRobinIntegration:
+class TestBalancingIntegration:
     @pytest.mark.asyncio
-    async def test_chat_completions_uses_round_robin(self):
-        """Two chat completion requests should use different backends."""
+    async def test_chat_completions_uses_balancing(self):
+        """Two chat completion requests should route to backends."""
         backends = _make_backends(2)
         server = BridgeServer(
             adapter=StubLauncher(),
@@ -171,24 +158,23 @@ class TestRoundRobinIntegration:
             m.post("https://api1.example.com/v1/chat/completions", payload=UPSTREAM_RESPONSE)
 
             async with aiohttp.ClientSession() as session:
-                # First request → backend 0
                 async with session.post(url, json=request_body) as resp:
                     assert resp.status == 200
                     await resp.json()
 
-                # Second request → backend 1
                 async with session.post(url, json=request_body) as resp:
                     assert resp.status == 200
                     await resp.json()
 
         await server.stop_async()
-        # Verify both backends were called
+        # Verify at least one backend was called (with 2 backends and 2 requests, both are likely but not guaranteed)
         from yarl import URL
 
-        requests_to_0 = list(m.requests.get(("POST", URL("https://api0.example.com/v1/chat/completions")), []))
-        requests_to_1 = list(m.requests.get(("POST", URL("https://api1.example.com/v1/chat/completions")), []))
-        assert len(requests_to_0) >= 1
-        assert len(requests_to_1) >= 1
+        total_requests = sum(
+            len(list(m.requests.get(("POST", URL(f"https://api{i}.example.com/v1/chat/completions")), [])))
+            for i in range(2)
+        )
+        assert total_requests >= 2
 
     @pytest.mark.asyncio
     async def test_chat_completions_single_backend(self):
@@ -243,17 +229,14 @@ class TestProviderConfigPropagation:
             backends=backends,
         )
 
-        # First backend → first provider_config
-        server._select_backend()
-        assert server._active_provider_config == {"custom_url": "https://custom0.example.com"}
+        # Each _select_backend call picks a random backend;
+        # verify that its provider_config is one of the expected values
+        valid_configs = {f"https://custom{i}.example.com" for i in range(3)}
 
-        # Second backend → second provider_config
-        server._select_backend()
-        assert server._active_provider_config == {"custom_url": "https://custom1.example.com"}
-
-        # Third backend → third provider_config
-        server._select_backend()
-        assert server._active_provider_config == {"custom_url": "https://custom2.example.com"}
+        random.seed(42)
+        for _ in range(20):
+            server._select_backend()
+            assert server._active_provider_config["custom_url"] in valid_configs
 
     def test_single_profile_uses_init_provider_config(self):
         """Without backends, _active_provider_config uses the init parameter."""

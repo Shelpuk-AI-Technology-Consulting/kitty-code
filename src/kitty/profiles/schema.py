@@ -85,7 +85,7 @@ class Profile(BaseModel):
 
 
 class BalancingProfile(BaseModel):
-    """A profile that round-robins LLM calls across a list of regular profiles.
+    """A profile that randomly distributes LLM calls across regular profiles.
 
     Balancing profiles cannot be nested — members must all be regular profiles.
     """
