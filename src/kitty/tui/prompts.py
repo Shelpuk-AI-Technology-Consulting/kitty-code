@@ -1,9 +1,10 @@
-"""TUI prompt utilities — text input, secret input, confirmation."""
+"""TUI prompt utilities — text input, secret input, confirmation via questionary."""
 
 from __future__ import annotations
 
-import getpass
 import sys
+
+import questionary
 
 __all__ = ["check_tty", "prompt_confirm", "prompt_secret", "prompt_text"]
 
@@ -25,10 +26,14 @@ def prompt_text(label: str) -> str:
         label: The prompt label to display.
 
     Returns:
-        The user's input string.
+        The user's input string (may be empty if cancelled; callers should validate).
+
+    Raises:
+        NonTTYError: If stdin is not a TTY.
     """
     check_tty()
-    return input(label)
+    result = questionary.text(label).ask()
+    return result if result is not None else ""
 
 
 def prompt_secret(label: str) -> str:
@@ -39,9 +44,13 @@ def prompt_secret(label: str) -> str:
 
     Returns:
         The user's secret input string.
+
+    Raises:
+        NonTTYError: If stdin is not a TTY.
     """
     check_tty()
-    return getpass.getpass(label)
+    result = questionary.password(label).ask()
+    return result if result is not None else ""
 
 
 def prompt_confirm(label: str, default: bool = True) -> bool:
@@ -49,20 +58,15 @@ def prompt_confirm(label: str, default: bool = True) -> bool:
 
     Args:
         label: The question to display.
-        default: Default value when user presses Enter without input.
+        default: Default value when user presses Enter without input or cancels.
 
     Returns:
         True for yes, False for no.
+
+    Raises:
+        NonTTYError: If stdin is not a TTY.
     """
     check_tty()
-    hint = "[Y/n]" if default else "[y/N]"
-
-    while True:
-        response = input(f"{label} {hint} ").strip().lower()
-        if not response:
-            return default
-        if response in ("y", "yes"):
-            return True
-        if response in ("n", "no"):
-            return False
-        # Invalid input — retry
+    result = questionary.confirm(label, default=default).ask()
+    # questionary returns None on Ctrl+C — fall back to the default
+    return result if result is not None else default

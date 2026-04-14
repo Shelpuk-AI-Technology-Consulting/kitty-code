@@ -39,6 +39,7 @@ _DEBUG_LOG_PATH = _DEBUG_LOG_DIR / "bridge.log"
 _MAX_RETRIES = 3
 _RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
 _BACKOFF_BASE = 1.0
+_EMPTY_RETRY_DELAYS = [5.0, 15.0]  # delays between retries for empty responses (non-balancing)
 
 # Error codes and patterns that indicate rate limiting or quota exhaustion.
 # These trigger the circuit breaker even on non-retryable HTTP statuses (e.g. 400).
@@ -245,6 +246,29 @@ class BridgeServer:
             delta = choices[0].get("delta", {})
             if delta.get("type") == "error" or delta.get("error") is not None:
                 return True
+        return False
+
+    @staticmethod
+    def _is_empty_cc_response(cc_response: dict) -> bool:
+        """Return True if a Chat Completions response has no content and no tool calls.
+
+        Used to detect empty upstream responses (HTTP 200 but no meaningful output).
+        """
+        choices = cc_response.get("choices", [])
+        if not choices:
+            return True
+        message = choices[0].get("message", {})
+        content = message.get("content")
+        tool_calls = message.get("tool_calls", [])
+        has_text = isinstance(content, str) and content.strip()
+        return not has_text and not tool_calls
+
+    @staticmethod
+    def _chunk_has_finish_reason(chunk: dict) -> bool:
+        """Return True if a streaming chunk contains a finish_reason."""
+        choices = chunk.get("choices", [])
+        if choices and isinstance(choices[0], dict):
+            return choices[0].get("finish_reason") is not None
         return False
 
     def _select_backend(self) -> None:
@@ -593,9 +617,12 @@ class BridgeServer:
         await sr.prepare(request)
 
         # Emit response.created and response.in_progress via translator
-        for event in translator.translate_stream_start(response_id, model):
-            logger.debug("SSE → %s", event.split("\n", 1)[0] if "\n" in event else event[:120])
-            await sr.write(event.encode())
+        start_events = translator.translate_stream_start(response_id, model)
+        # We buffer start events and only write them if the response is non-empty.
+        # This prevents the client from seeing a partial message lifecycle
+        # when we failover due to an empty response.
+        for event in start_events:
+            logger.debug("Buffered start event: %s", event.split("\n", 1)[0] if "\n" in event else event[:120])
 
         upstream_status = None
         terminal_status = "completed"
@@ -665,6 +692,7 @@ class BridgeServer:
                     chunk_count = 0
                     done = False
                     stream_error = False
+                    finish_events: list[str] = []  # buffered finish events
                     async for chunk_bytes in upstream.content:
                         chunk_count += 1
                         raw = chunk_bytes.decode("utf-8", errors="replace")
@@ -699,9 +727,13 @@ class BridgeServer:
                                             break
                                     # No healthy backends — pass error to agent via translator
                                 events = translator.translate_stream_chunk(response_id, chunk)
-                                for event in events:
-                                    logger.debug("SSE → %s", event.split("\n", 1)[0][:120])
-                                    await sr.write(event.encode())
+                                # Buffer finish events to detect empty responses before writing
+                                if self._chunk_has_finish_reason(chunk):
+                                    finish_events.extend(events)
+                                else:
+                                    for event in events:
+                                        logger.debug("SSE → %s", event.split("\n", 1)[0][:120])
+                                        await sr.write(event.encode())
 
                     logger.debug(
                         "Upstream stream ended. chunks=%d done=%s remaining_buffer=%d chars",
@@ -720,9 +752,12 @@ class BridgeServer:
                                 try:
                                     chunk = json.loads(data_str)
                                     events = translator.translate_stream_chunk(response_id, chunk)
-                                    for event in events:
-                                        logger.debug("SSE (flush) → %s", event.split("\n", 1)[0][:120])
-                                        await sr.write(event.encode())
+                                    if self._chunk_has_finish_reason(chunk):
+                                        finish_events.extend(events)
+                                    else:
+                                        for event in events:
+                                            logger.debug("SSE (flush) → %s", event.split("\n", 1)[0][:120])
+                                            await sr.write(event.encode())
                                 except json.JSONDecodeError:
                                     logger.warning("Failed to parse flushed SSE data: %s", data_str[:200])
 
@@ -740,11 +775,53 @@ class BridgeServer:
                                 attempt + 1,
                                 max_attempts,
                             )
-                            # Reset stream state for next attempt
-                            # Note: Already emitted response.created/in_progress at start
                             continue
                         # No more backends — error already logged, stream continues to end
                         terminal_status = "incomplete"
+
+                    # Check for empty response
+                    if translator.response_was_empty and finish_events:
+                        translator.reset()
+                        finish_events.clear()
+                        if self._backends and self._current_backend_idx >= 0:
+                            self._mark_backend_unhealthy(self._current_backend_idx)
+                            if self._any_healthy_backend() and attempt < max_attempts - 1:
+                                self._select_backend()
+                                self._normalize_model(cc_request)
+                                self._active_provider.normalize_request(cc_request)
+                                url = self._build_upstream_url()
+                                headers = self._build_upstream_headers()
+                                upstream_body = self._active_provider.translate_to_upstream(cc_request)
+                                logger.info(
+                                    "Responses stream empty response: attempt %d/%d, switching backend",
+                                    attempt + 1,
+                                    max_attempts,
+                                )
+                                continue
+                            logger.warning(
+                                "All backends returned empty response for %s, emitting fallback",
+                                response_id,
+                            )
+                        elif attempt < max_attempts - 1:
+                            delay = _BACKOFF_BASE * (2 ** (attempt % (_MAX_RETRIES + 1)))
+                            logger.warning(
+                                "Responses stream empty response: retrying in %.1fs (%d/%d)",
+                                delay,
+                                attempt + 1,
+                                max_attempts,
+                            )
+                            await asyncio.sleep(delay)
+                            continue
+                        else:
+                            logger.warning(
+                                "Responses stream empty response after %d attempts, emitting fallback",
+                                max_attempts,
+                            )
+
+                    # Write buffered finish events to client
+                    for event in finish_events:
+                        logger.debug("SSE (finish) → %s", event.split("\n", 1)[0][:120])
+                        await sr.write(event.encode())
                     break  # Exit retry loop
 
         except asyncio.TimeoutError:
@@ -939,6 +1016,7 @@ class BridgeServer:
                         done = False
                         stream_error = False
                         chunk_count = 0
+                        finish_events: list[str] = []  # buffered finish events
                         async for chunk_bytes in upstream.content:
                             if done:
                                 break
@@ -970,8 +1048,12 @@ class BridgeServer:
                                                 break
                                         # No healthy backends — pass error to agent via translator
                                     events = translator.translate_stream_chunk(message_id, model, chunk)
-                                    for event in events:
-                                        await sr.write(event.encode())
+                                    # Buffer finish events to detect empty responses before writing
+                                    if self._chunk_has_finish_reason(chunk):
+                                        finish_events.extend(events)
+                                    else:
+                                        for event in events:
+                                            await sr.write(event.encode())
 
                         logger.debug("Upstream stream ended. chunks=%d done=%s", chunk_count, done)
 
@@ -984,8 +1066,11 @@ class BridgeServer:
                                     try:
                                         chunk = json.loads(data_str)
                                         events = translator.translate_stream_chunk(message_id, model, chunk)
-                                        for event in events:
-                                            await sr.write(event.encode())
+                                        if self._chunk_has_finish_reason(chunk):
+                                            finish_events.extend(events)
+                                        else:
+                                            for event in events:
+                                                await sr.write(event.encode())
                                     except json.JSONDecodeError:
                                         logger.warning("Failed to parse flushed SSE data: %s", data_str[:200])
 
@@ -1004,6 +1089,58 @@ class BridgeServer:
                                 max_attempts,
                             )
                             continue
+
+                        # Check for empty response: if the translator detected an empty stream
+                        # (finish_reason but no content), buffer the fallback events and retry
+                        # instead of sending them to the client.
+                        if translator.response_was_empty and finish_events:
+                            retried = False
+                            if self._backends and self._current_backend_idx >= 0:
+                                self._mark_backend_unhealthy(self._current_backend_idx)
+                                if self._any_healthy_backend() and attempt < max_attempts - 1:
+                                    translator.reset()
+                                    finish_events.clear()
+                                    self._select_backend()
+                                    self._normalize_model(cc_request)
+                                    self._active_provider.normalize_request(cc_request)
+                                    url = self._build_upstream_url()
+                                    headers = self._build_upstream_headers()
+                                    upstream_body = self._active_provider.translate_to_upstream(cc_request)
+                                    logger.info(
+                                        "Messages stream empty response: attempt %d/%d, switching backend",
+                                        attempt + 1,
+                                        max_attempts,
+                                    )
+                                    retried = True
+                                else:
+                                    logger.warning(
+                                        "All backends returned empty response for %s, emitting fallback",
+                                        message_id,
+                                    )
+                            elif attempt < max_attempts - 1:
+                                # Non-balancing: retry with backoff
+                                translator.reset()
+                                finish_events.clear()
+                                delay = _BACKOFF_BASE * (2 ** (attempt % (_MAX_RETRIES + 1)))
+                                logger.warning(
+                                    "Messages stream empty response: retrying in %.1fs (%d/%d)",
+                                    delay,
+                                    attempt + 1,
+                                    max_attempts,
+                                )
+                                await asyncio.sleep(delay)
+                                retried = True
+                            else:
+                                logger.warning(
+                                    "Messages stream empty response after %d attempts, emitting fallback",
+                                    max_attempts,
+                                )
+                            if retried:
+                                continue
+
+                        # Write buffered finish events to client
+                        for event in finish_events:
+                            await sr.write(event.encode())
                         break  # Exit retry loop
                 except Exception as exc:
                     if _is_retryable_exception(exc):
@@ -1239,6 +1376,7 @@ class BridgeServer:
                     line_buffer = ""
                     done = False
                     stream_error = False
+                    finish_events: list[str] = []  # buffered finish events
                     async for chunk_bytes in upstream.content:
                         if done:
                             break
@@ -1269,8 +1407,12 @@ class BridgeServer:
                                             break
                                     # No healthy backends — pass error to agent via translator
                                 events = translator.translate_stream_chunk(chunk)
-                                for event in events:
-                                    await sr.write(event.encode())
+                                # Buffer finish events to detect empty responses before writing
+                                if self._chunk_has_finish_reason(chunk):
+                                    finish_events.extend(events)
+                                else:
+                                    for event in events:
+                                        await sr.write(event.encode())
 
                     # Flush remaining buffer
                     if not done and line_buffer.strip():
@@ -1281,8 +1423,11 @@ class BridgeServer:
                                 try:
                                     chunk = json.loads(data_str)
                                     events = translator.translate_stream_chunk(chunk)
-                                    for event in events:
-                                        await sr.write(event.encode())
+                                    if self._chunk_has_finish_reason(chunk):
+                                        finish_events.extend(events)
+                                    else:
+                                        for event in events:
+                                            await sr.write(event.encode())
                                 except json.JSONDecodeError:
                                     logger.warning("Failed to parse flushed SSE data: %s", data_str[:200])
 
@@ -1303,6 +1448,48 @@ class BridgeServer:
                             continue
                         # No more backends — error already logged, stream continues to end
                         done = True
+
+                    # Check for empty response
+                    if translator.response_was_empty and finish_events:
+                        translator.reset()
+                        finish_events.clear()
+                        if self._backends and self._current_backend_idx >= 0:
+                            self._mark_backend_unhealthy(self._current_backend_idx)
+                            if self._any_healthy_backend() and attempt < max_attempts - 1:
+                                self._select_backend()
+                                self._normalize_model(cc_request)
+                                self._active_provider.normalize_request(cc_request)
+                                url = self._build_upstream_url()
+                                headers = self._build_upstream_headers()
+                                upstream_body = self._active_provider.translate_to_upstream(cc_request)
+                                logger.info(
+                                    "Gemini stream empty response: attempt %d/%d, switching backend",
+                                    attempt + 1,
+                                    max_attempts,
+                                )
+                                continue
+                            logger.warning(
+                                "All backends returned empty response, emitting fallback",
+                            )
+                        elif attempt < max_attempts - 1:
+                            delay = _BACKOFF_BASE * (2 ** (attempt % (_MAX_RETRIES + 1)))
+                            logger.warning(
+                                "Gemini stream empty response: retrying in %.1fs (%d/%d)",
+                                delay,
+                                attempt + 1,
+                                max_attempts,
+                            )
+                            await asyncio.sleep(delay)
+                            continue
+                        else:
+                            logger.warning(
+                                "Gemini stream empty response after %d attempts, emitting fallback",
+                                max_attempts,
+                            )
+
+                    # Write buffered finish events
+                    for event in finish_events:
+                        await sr.write(event.encode())
                     break  # Exit retry loop
 
         except asyncio.TimeoutError:
@@ -1337,27 +1524,65 @@ class BridgeServer:
     # ── Chat Completions pass-through handler ─────────────────────────────
 
     async def _request_with_retry(self, cc_request: dict) -> dict:
-        """Make an upstream request with automatic retry on balancing backends.
+        """Make an upstream request with automatic retry on errors and empty responses.
 
-        For non-balancing mode (no backends), makes a single attempt.
-        For balancing mode, retries up to N times (where N = number of backends),
-        marking failed backends as unhealthy.
+        For non-balancing mode (no backends): retries empty responses up to
+        len(_EMPTY_RETRY_DELAYS)+1 times with backoff.
+        For balancing mode: retries up to N times (where N = number of backends),
+        marking failed backends as unhealthy.  Also retries empty responses
+        across backends.
         """
-        if not self._backends:
-            return await self._make_upstream_request(cc_request)
+        if self._backends:
+            return await self._request_with_retry_balancing(cc_request)
+        return await self._request_with_retry_single(cc_request)
 
+    async def _request_with_retry_single(self, cc_request: dict) -> dict:
+        """Non-balancing retry: retry empty responses with backoff."""
+        max_attempts = len(_EMPTY_RETRY_DELAYS) + 1
+        for attempt in range(max_attempts):
+            cc_response = await self._make_upstream_request(cc_request)
+            if not self._is_empty_cc_response(cc_response):
+                return cc_response
+            if attempt < max_attempts - 1:
+                delay = _EMPTY_RETRY_DELAYS[attempt]
+                logger.warning(
+                    "Empty upstream response, retrying in %.1fs (%d/%d)",
+                    delay,
+                    attempt + 1,
+                    max_attempts,
+                )
+                await asyncio.sleep(delay)
+        # All retries exhausted — return the empty response
+        # (translator will add fallback text)
+        logger.warning("Empty upstream response after %d attempts, returning fallback", max_attempts)
+        return cc_response
+
+    async def _request_with_retry_balancing(self, cc_request: dict) -> dict:
+        """Balancing retry: failover across backends on errors or empty responses."""
         n_backends = len(self._backends)
         last_exc: UpstreamError | Exception | None = None
+        last_response: dict | None = None
 
         for attempt in range(n_backends):
             if attempt > 0:
-                # Re-select backend and re-normalize for the new backend
                 self._select_backend()
                 self._normalize_model(cc_request)
                 self._active_provider.normalize_request(cc_request)
 
             try:
-                return await self._make_upstream_request(cc_request)
+                cc_response = await self._make_upstream_request(cc_request)
+                if not self._is_empty_cc_response(cc_response):
+                    return cc_response
+                # Empty response — mark backend unhealthy and try next
+                last_response = cc_response
+                idx = self._current_backend_idx
+                if idx >= 0:
+                    self._mark_backend_unhealthy(idx)
+                logger.info(
+                    "Backend attempt %d/%d returned empty response, marking unhealthy",
+                    attempt + 1,
+                    n_backends,
+                )
             except UpstreamError as exc:
                 last_exc = exc
                 idx = self._current_backend_idx
@@ -1381,10 +1606,15 @@ class BridgeServer:
                     exc,
                 )
 
-        # All attempts exhausted — propagate the last error
-        if isinstance(last_exc, UpstreamError):
+        # All attempts exhausted — return last response (translator adds fallback) or propagate error
+        if last_exc is not None:
+            if isinstance(last_exc, UpstreamError):
+                raise last_exc
             raise last_exc
-        raise last_exc  # type: ignore[misc]
+        # All backends returned empty — return the empty response
+        if last_response is not None:
+            return last_response
+        raise RuntimeError("All backends exhausted with no response")
 
     async def _handle_chat_completions(self, request: web.Request) -> web.StreamResponse:
         """Handle Chat Completions pass-through requests.
@@ -1514,6 +1744,7 @@ class BridgeServer:
 
                     # Success path — pass-through stream
                     stream_error = False
+                    has_content = False
                     async for chunk_bytes in upstream.content:
                         try:
                             # Detect in-stream errors for balancing mode
@@ -1538,6 +1769,7 @@ class BridgeServer:
                                     if stream_error:
                                         break
                             for translated in self._active_provider.translate_upstream_stream_event(chunk_bytes):
+                                has_content = True
                                 await sr.write(translated)
                         except (ConnectionResetError, BrokenPipeError, OSError):
                             logger.debug("Client disconnected during streaming")
@@ -1558,6 +1790,34 @@ class BridgeServer:
                             max_attempts,
                         )
                         continue
+
+                    # Check for empty response (pass-through: no content bytes written)
+                    if not has_content:
+                        if self._backends and self._current_backend_idx >= 0:
+                            self._mark_backend_unhealthy(self._current_backend_idx)
+                            if self._any_healthy_backend() and attempt < max_attempts - 1:
+                                self._select_backend()
+                                self._normalize_model(cc_request)
+                                self._active_provider.normalize_request(cc_request)
+                                url = self._build_upstream_url()
+                                headers = self._build_upstream_headers()
+                                upstream_body = self._active_provider.translate_to_upstream(cc_request)
+                                logger.info(
+                                    "CC stream empty response: attempt %d/%d, switching backend",
+                                    attempt + 1,
+                                    max_attempts,
+                                )
+                                continue
+                        elif attempt < max_attempts - 1:
+                            delay = _BACKOFF_BASE * (2 ** (attempt % (_MAX_RETRIES + 1)))
+                            logger.warning(
+                                "CC stream empty response: retrying in %.1fs (%d/%d)",
+                                delay,
+                                attempt + 1,
+                                max_attempts,
+                            )
+                            await asyncio.sleep(delay)
+                            continue
                     break  # Exit retry loop
 
         except asyncio.TimeoutError:

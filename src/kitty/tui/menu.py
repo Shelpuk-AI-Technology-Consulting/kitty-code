@@ -1,21 +1,21 @@
-"""TUI selection menu — numbered list with keyboard input."""
+"""TUI selection menus — arrow-key navigation and checkbox selection via questionary."""
 
 from __future__ import annotations
 
 import sys
+from collections.abc import Callable
+from typing import Any
 
-from rich.console import Console
+import questionary
 
-__all__ = ["SelectionMenu"]
-
-_console = Console()
+__all__ = ["CheckboxMenu", "SelectionMenu"]
 
 
 class SelectionMenu:
-    """Numbered selection menu for interactive CLI.
+    """Single-item arrow-key menu.
 
-    Displays options as a numbered list and reads the user's choice.
-    Returns None in non-interactive (non-TTY) environments.
+    Uses questionary.select() for inline rendering with arrow-key navigation.
+    Returns None in non-interactive (non-TTY) environments or when cancelled.
     """
 
     def __init__(self, title: str, options: list[str]) -> None:
@@ -30,29 +30,51 @@ class SelectionMenu:
         """
         if not sys.stdin.isatty():
             return None
-
         if not self._options:
             return None
+        return questionary.select(
+            self._title,
+            choices=self._options,
+        ).ask()
 
-        while True:
-            _console.print(f"\n[bold]{self._title}[/bold]")
-            for i, option in enumerate(self._options, 1):
-                _console.print(f"  [cyan]{i}.[/cyan] {option}")
-            _console.print("  [dim]q. Cancel[/dim]")
 
-            try:
-                choice = input(f"Select [1-{len(self._options)}]: ").strip()
-            except (EOFError, KeyboardInterrupt):
-                return None
+class CheckboxMenu:
+    """Multi-item checkbox menu.
 
-            if choice.lower() == "q" or choice == "":
-                return None
+    Uses questionary.checkbox() for inline rendering with Space-to-toggle navigation.
+    Returns None in non-interactive (non-TTY) environments or when cancelled.
+    Supports pre-checked items and optional validation.
+    """
 
-            try:
-                index = int(choice)
-                if 1 <= index <= len(self._options):
-                    return self._options[index - 1]
-            except ValueError:
-                pass
+    def __init__(
+        self,
+        title: str,
+        options: list[str],
+        default_checked: list[str] | None = None,
+        validate: Callable[[list[str]], bool | str] | None = None,
+    ) -> None:
+        self._title = title
+        self._options = options
+        self._default_checked = set(default_checked or [])
+        self._validate = validate
 
-            # Invalid choice — loop and retry
+    def show(self) -> list[str] | None:
+        """Display the checkbox menu and return the selected options.
+
+        Returns:
+            List of selected option strings (may be empty), or None if cancelled
+            or non-interactive.
+        """
+        if not sys.stdin.isatty():
+            return None
+
+        choices: list[Any] = [
+            questionary.Choice(title=opt, value=opt, checked=opt in self._default_checked)
+            for opt in self._options
+        ]
+
+        kwargs: dict[str, Any] = {"choices": choices}
+        if self._validate is not None:
+            kwargs["validate"] = self._validate
+
+        return questionary.checkbox(self._title, **kwargs).ask()

@@ -39,10 +39,16 @@ class MessagesTranslator:
         self._message_started: bool = False
         self._finished: bool = False
         self._last_message_id: str | None = None
+        self._last_was_empty: bool = False
 
     @property
     def thinking_warned(self) -> bool:
         return self._thinking_warned
+
+    @property
+    def response_was_empty(self) -> bool:
+        """True if the last translated streaming chunk produced only fallback text (no real content)."""
+        return self._last_was_empty
 
     def reset(self) -> None:
         """Clear internal streaming state between requests."""
@@ -51,6 +57,8 @@ class MessagesTranslator:
         self._content_block_index = 0
         self._text_block_opened = False
         self._message_started = False
+        self._finished = False
+        self._last_was_empty = False
 
     # ── Request translation ───────────────────────────────────────────────
 
@@ -293,6 +301,9 @@ class MessagesTranslator:
         # Defensive fallback: never emit empty assistant output when no tool call exists.
         if not content and not tool_calls:
             content.append({"type": "text", "text": self._fallback_assistant_text(message)})
+            self._last_was_empty = True
+        else:
+            self._last_was_empty = False
 
         stop_reason = TranslationEngine.map_finish_reason(finish_reason)
         usage = cc_response.get("usage") or {}
@@ -462,5 +473,6 @@ class MessagesTranslator:
             # (some models/providers emit a second empty finish chunk after reset).
             # Set AFTER reset() so the flag survives the state cleanup.
             self._finished = True
+            self._last_was_empty = not has_content_blocks
 
         return events

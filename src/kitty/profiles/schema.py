@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import typing
 import uuid
 from typing import Literal
 
@@ -30,6 +31,8 @@ _PROVIDER_TYPES = Literal[
     "fireworks",
     "opencode_go",
 ]
+
+PROVIDER_LIST: list[str] = list(typing.get_args(_PROVIDER_TYPES))
 
 
 class HttpsUrl(_HttpUrl):
@@ -114,4 +117,4 @@ class BalancingProfile(BaseModel):
 
 BackendConfig = Profile | BalancingProfile
 
-__all__ = ["RESERVED_NAMES", "Profile", "BalancingProfile", "BackendConfig"]
+__all__ = ["PROVIDER_LIST", "RESERVED_NAMES", "Profile", "BalancingProfile", "BackendConfig"]

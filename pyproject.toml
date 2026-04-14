@@ -33,6 +33,7 @@ dependencies = [
     "platformdirs>=4.0",
     "pyyaml>=6.0",
     "boto3>=1.34",
+    "questionary>=2.0",
 ]
 
 [project.urls]
@@ -84,7 +85,7 @@ warn_return_any = true
 warn_unused_configs = true
 
 [[tool.mypy.overrides]]
-module = ["aiohttp.*", "keyring.*", "filelock.*", "platformdirs.*", "rich.*", "aioresponses.*", "boto3.*", "botocore.*"]
+module = ["aiohttp.*", "keyring.*", "filelock.*", "platformdirs.*", "rich.*", "aioresponses.*", "boto3.*", "botocore.*", "questionary.*"]
 ignore_missing_imports = true
 
 [tool.importlinter]

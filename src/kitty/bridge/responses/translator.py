@@ -53,11 +53,12 @@ class ResponsesTranslator:
         self._seq: int = 0
         self._text_item_id: str | None = None
         self._text_started: bool = False
+        self._last_was_empty: bool = False
 
-    def _next_seq(self) -> int:
-        seq = self._seq
-        self._seq += 1
-        return seq
+    @property
+    def response_was_empty(self) -> bool:
+        """True if the last translated response produced no meaningful content."""
+        return self._last_was_empty
 
     def reset(self) -> None:
         """Clear internal streaming state between requests."""
@@ -67,6 +68,12 @@ class ResponsesTranslator:
         self._seq = 0
         self._text_item_id = None
         self._text_started = False
+        self._last_was_empty = False
+
+    def _next_seq(self) -> int:
+        seq = self._seq
+        self._seq += 1
+        return seq
 
     # ── Stream lifecycle ───────────────────────────────────────────────────
 
@@ -527,7 +534,10 @@ class ResponsesTranslator:
         }
         events.append(format_response_completed_event(response_id, seq=self._next_seq(), response_data=response_data))
 
+        # Track emptiness before reset clears the state
+        was_empty = not clean_text and not self._tool_call_buffers
         self.reset()
+        self._last_was_empty = was_empty
         return events
 
     def synthesize_completed_events(
@@ -649,5 +659,7 @@ class ResponsesTranslator:
         }
         events.append(format_response_completed_event(response_id, seq=self._next_seq(), response_data=response_data))
 
+        was_empty = not clean_text and not self._tool_call_buffers
         self.reset()
+        self._last_was_empty = was_empty
         return events

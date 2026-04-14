@@ -44,6 +44,7 @@ class TestRunSetupWizard:
         with (
             _mock_tty(),
             patch(f"{_MOD}.SelectionMenu.show", return_value="zai_regular"),
+            patch(f"{_MOD}._find_reusable_auth_ref", return_value=None),
             patch(f"{_MOD}.prompt_secret", return_value="sk-test-api-key-12345"),
             patch(f"{_MOD}.prompt_text", side_effect=["gpt-4o", "myprofile"]),
             patch(f"{_MOD}.prompt_confirm", side_effect=[True, False]),
@@ -70,6 +71,7 @@ class TestRunSetupWizard:
         with (
             _mock_tty(),
             patch(f"{_MOD}.SelectionMenu.show", return_value="novita"),
+            patch(f"{_MOD}._find_reusable_auth_ref", return_value=None),
             patch(f"{_MOD}.prompt_secret", return_value="sk-key"),
             patch(f"{_MOD}.prompt_text", side_effect=["model-x", ""]),
             patch(f"{_MOD}.prompt_confirm", side_effect=[False, False]),
@@ -85,6 +87,7 @@ class TestRunSetupWizard:
         with (
             _mock_tty(),
             patch(f"{_MOD}.SelectionMenu.show", return_value="zai_regular"),
+            patch(f"{_MOD}._find_reusable_auth_ref", return_value=None),
             patch(f"{_MOD}.prompt_secret", return_value="sk-key"),
             patch(f"{_MOD}.prompt_text", side_effect=["gpt-4o", "setup", "goodname"]),
             patch(f"{_MOD}.prompt_confirm", side_effect=[True, False]),
@@ -99,6 +102,7 @@ class TestRunSetupWizard:
         with (
             _mock_tty(),
             patch(f"{_MOD}.SelectionMenu.show", return_value="zai_regular"),
+            patch(f"{_MOD}._find_reusable_auth_ref", return_value=None),
             patch(f"{_MOD}.prompt_secret", return_value="sk-key"),
             patch(f"{_MOD}.prompt_text", side_effect=["gpt-4o", "BAD NAME!", "valid-name"]),
             patch(f"{_MOD}.prompt_confirm", side_effect=[True, False]),
@@ -113,6 +117,7 @@ class TestRunSetupWizard:
         with (
             _mock_tty(),
             patch(f"{_MOD}.SelectionMenu.show", return_value="zai_regular"),
+            patch(f"{_MOD}._find_reusable_auth_ref", return_value=None),
             patch(f"{_MOD}.prompt_secret", return_value="sk-key"),
             patch(f"{_MOD}.prompt_text", side_effect=["gpt-4o", "test"]),
             patch(f"{_MOD}.prompt_confirm", side_effect=[True, True]),
@@ -129,6 +134,7 @@ class TestRunSetupWizard:
         with (
             _mock_tty(),
             patch(f"{_MOD}.SelectionMenu.show", return_value="zai_regular"),
+            patch(f"{_MOD}._find_reusable_auth_ref", return_value=None),
             patch(f"{_MOD}.prompt_secret", return_value="sk-key"),
             patch(f"{_MOD}.prompt_text", side_effect=["gpt-4o", "test"]),
             patch(f"{_MOD}.prompt_confirm", side_effect=[True, True]),
@@ -139,3 +145,30 @@ class TestRunSetupWizard:
 
         assert profile is not None
         mock_status.assert_called()
+
+    def test_wizard_reuses_existing_key(self, store: ProfileStore, cred_store: CredentialStore) -> None:
+        """T22: wizard offers key reuse when same-provider profile exists; accepted → shared auth_ref."""
+        import uuid as _uuid
+        existing_ref = str(_uuid.uuid4())
+
+        with (
+            _mock_tty(),
+            patch(f"{_MOD}.SelectionMenu.show", return_value="minimax"),
+            patch(f"{_MOD}._find_reusable_auth_ref", return_value=existing_ref),
+            patch(f"{_MOD}.prompt_confirm", side_effect=[True, True, False]),  # reuse=True, default=True, no conn.check
+            patch(f"{_MOD}.prompt_secret") as mock_secret,
+            patch(f"{_MOD}.prompt_text", side_effect=["moonshot-v1", "myprofile"]),
+        ):
+            profile = run_setup_wizard(store, cred_store)
+
+        assert profile.auth_ref == existing_ref
+        mock_secret.assert_not_called()
+
+    def test_wizard_cancelled_at_provider_step_raises(self, store: ProfileStore, cred_store: CredentialStore) -> None:
+        """T23: Cancelling provider selection raises NonTTYError."""
+        from kitty.tui.prompts import NonTTYError
+        with (
+            _mock_tty(),
+            patch(f"{_MOD}.SelectionMenu.show", return_value=None),pytest.raises(NonTTYError)
+        ):
+            run_setup_wizard(store, cred_store)

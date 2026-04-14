@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 
 from kitty.credentials.store import CredentialStore
-from kitty.profiles.schema import _NAME_PATTERN, RESERVED_NAMES, Profile
+from kitty.profiles.schema import _NAME_PATTERN, PROVIDER_LIST, RESERVED_NAMES, Profile
 from kitty.profiles.store import ProfileStore
 from kitty.tui.display import print_error, print_section, print_status, print_step, print_warning, status_spinner
 from kitty.tui.menu import SelectionMenu
@@ -13,13 +13,19 @@ from kitty.tui.prompts import NonTTYError, check_tty, prompt_confirm, prompt_sec
 
 __all__ = ["run_setup_wizard"]
 
+# Re-export _find_reusable_auth_ref at this module level so that tests can mock
+# it as "kitty.cli.setup_cmd._find_reusable_auth_ref" without knowing which
+# module owns it.  Without this re-export, patching the function here would
+# have no effect because setup_cmd would keep using the original reference.
+from kitty.cli.profile_cmd import _find_reusable_auth_ref  # noqa: F401
+
 
 def run_setup_wizard(store: ProfileStore, cred_store: CredentialStore) -> Profile:
     """Run the first-run setup wizard to create a profile.
 
     Steps:
-    1. Provider selection
-    2. API key entry (masked)
+    1. Provider selection (arrow-key menu)
+    2. API key entry — offers reuse if a same-provider profile already exists
     3. Model selection
     4. Profile name (validated)
     5. Set as default confirmation
@@ -41,34 +47,31 @@ def run_setup_wizard(store: ProfileStore, cred_store: CredentialStore) -> Profil
 
     # Step 1: Provider selection
     print_step(1, 6, "Provider selection")
-    provider_menu = SelectionMenu(
-        "Select provider",
-        [
-            "zai_regular",
-            "zai_coding",
-            "minimax",
-            "novita",
-            "ollama",
-            "openai",
-            "openrouter",
-            "fireworks",
-            "anthropic",
-            "bedrock",
-            "azure",
-            "vertex",
-            "opencode_go",
-        ],
-    )
-    provider = provider_menu.show()
+    provider = SelectionMenu("Select provider", PROVIDER_LIST).show()
     if provider is None:
         raise NonTTYError("Provider selection cancelled")
 
-    # Step 2: API key (masked)
+    # Step 2: API key — offer reuse if a same-provider profile exists
     print_step(2, 6, "API key")
-    api_key = prompt_secret("Enter API key: ")
-    if not api_key:
-        print_error("API key cannot be empty")
-        raise ValueError("API key cannot be empty")
+    existing_auth_ref = _find_reusable_auth_ref(store, cred_store, provider)
+    if existing_auth_ref is not None:
+        reuse = prompt_confirm(f"Reuse existing API key for {provider!r}?", default=True)
+        if reuse:
+            auth_ref = existing_auth_ref
+        else:
+            api_key = prompt_secret("Enter new API key: ")
+            if not api_key:
+                print_error("API key cannot be empty")
+                raise ValueError("API key cannot be empty")
+            auth_ref = str(uuid.uuid4())
+            cred_store.set(auth_ref, api_key)
+    else:
+        api_key = prompt_secret("Enter API key: ")
+        if not api_key:
+            print_error("API key cannot be empty")
+            raise ValueError("API key cannot be empty")
+        auth_ref = str(uuid.uuid4())
+        cred_store.set(auth_ref, api_key)
 
     # Step 3: Model
     print_step(3, 6, "Model selection")
@@ -83,15 +86,15 @@ def run_setup_wizard(store: ProfileStore, cred_store: CredentialStore) -> Profil
     is_first = len(store.load_all()) == 0
     while True:
         name = prompt_text("Enter profile name (leave empty for default): ")
-        if not name or not name.strip():
-            name = provider  # Default to provider name
-            break
-        name = name.strip().lower()
+        name = provider if not name or not name.strip() else name.strip().lower()
         if name in RESERVED_NAMES:
             print_error(f"Profile name {name!r} is reserved")
             continue
         if not _NAME_PATTERN.match(name):
             print_error("Name must be lowercase, 1-32 chars, alphanumeric/dash/underscore")
+            continue
+        if store.get_backend(name) is not None:
+            print_error(f"Profile {name!r} already exists")
             continue
         break
 
@@ -100,7 +103,6 @@ def run_setup_wizard(store: ProfileStore, cred_store: CredentialStore) -> Profil
     set_default = is_first or prompt_confirm("Set as default profile?", default=True)
 
     # Create profile
-    auth_ref = str(uuid.uuid4())
     profile = Profile(
         name=name,
         provider=provider,  # type: ignore[arg-type]
@@ -109,8 +111,6 @@ def run_setup_wizard(store: ProfileStore, cred_store: CredentialStore) -> Profil
         is_default=set_default,
     )
 
-    # Save credential and profile
-    cred_store.set(auth_ref, api_key)
     store.save(profile)
     print_status(f"Profile {name!r} created successfully")
 
@@ -118,7 +118,7 @@ def run_setup_wizard(store: ProfileStore, cred_store: CredentialStore) -> Profil
     print_step(6, 6, "Connectivity check")
     if prompt_confirm("Test connectivity to provider?", default=True):
         with status_spinner("Testing connectivity..."):
-            connected = _check_connectivity(provider, api_key)
+            connected = _check_connectivity(provider, auth_ref)
         if connected:
             print_status("Connectivity check passed")
         else:
@@ -127,12 +127,12 @@ def run_setup_wizard(store: ProfileStore, cred_store: CredentialStore) -> Profil
     return profile
 
 
-def _check_connectivity(provider_type: str, api_key: str) -> bool:
+def _check_connectivity(provider_type: str, auth_ref: str) -> bool:
     """Test connectivity to the provider's API.
 
     Args:
         provider_type: Provider type string.
-        api_key: API key to use for authentication.
+        auth_ref: Auth reference (unused for basic check).
 
     Returns:
         True if connectivity check passed, False otherwise.
@@ -141,7 +141,6 @@ def _check_connectivity(provider_type: str, api_key: str) -> bool:
         from kitty.providers.registry import get_provider
 
         get_provider(provider_type)  # Verify provider is resolvable
-        # A real connectivity check would make an HTTP request
         return True
     except Exception:
         return False

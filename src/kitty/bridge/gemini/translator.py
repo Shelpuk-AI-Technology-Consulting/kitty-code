@@ -43,11 +43,20 @@ class GeminiTranslator:
     def __init__(self) -> None:
         self._tool_call_buffers: dict[int, ToolCallBuffer] = {}
         self._tool_call_meta: dict[int, dict] = {}  # {index: {id, name}}
+        self._last_was_empty: bool = False
+        self._saw_content: bool = False
+
+    @property
+    def response_was_empty(self) -> bool:
+        """True if the last translated response produced no meaningful content."""
+        return self._last_was_empty
 
     def reset(self) -> None:
         """Clear all streaming state between requests."""
         self._tool_call_buffers.clear()
         self._tool_call_meta.clear()
+        self._last_was_empty = False
+        self._saw_content = False
 
     # ── Request translation ──────────────────────────────────────────────────
 
@@ -236,6 +245,7 @@ class GeminiTranslator:
         # Text delta
         text = delta.get("content")
         if text:
+            self._saw_content = True
             events.append(
                 format_gemini_sse(
                     {
@@ -305,6 +315,8 @@ class GeminiTranslator:
                     "totalTokenCount": usage.get("total_tokens", 0),
                 }
             events.append(format_gemini_sse(finish_data))
+            was_empty = not self._saw_content and not self._tool_call_buffers
             self.reset()
+            self._last_was_empty = was_empty
 
         return events
