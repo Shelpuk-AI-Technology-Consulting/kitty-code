@@ -43,7 +43,7 @@ That's it. Your coding agent now talks to the LLM you chose — not the one it w
 $ pip install kitty-bridge
 $ kitty setup
   ? Provider: openai
-  ? Model: glm-4-plus
+  ? Model: openai/gpt-5.4-pro
   ? API key: ********
 
 $ kitty claude
