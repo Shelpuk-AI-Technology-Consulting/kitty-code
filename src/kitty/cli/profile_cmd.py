@@ -152,7 +152,7 @@ def _create_profile_flow(store: ProfileStore, cred_store: CredentialStore) -> Pr
         cred_store.set(auth_ref, api_key)
 
     # Step 3: Model
-    model = prompt_text("Enter model name: ")
+    model = prompt_text("Model (OpenRouter or provider format, e.g. z-ai/glm-5): ")
     if not model or not model.strip():
         print_error("Model name cannot be empty")
         raise ValueError("Model name cannot be empty")

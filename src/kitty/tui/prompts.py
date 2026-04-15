@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 
 import questionary
+from prompt_toolkit import prompt as pt_prompt
 
 __all__ = ["check_tty", "prompt_confirm", "prompt_secret", "prompt_text"]
 
@@ -37,7 +38,9 @@ def prompt_text(label: str) -> str:
 
 
 def prompt_secret(label: str) -> str:
-    """Prompt the user for secret input (masked).
+    """Prompt the user for secret input (masked with asterisks).
+
+    Shows one ``*`` per character so the user can see that input was accepted.
 
     Args:
         label: The prompt label to display.
@@ -49,8 +52,10 @@ def prompt_secret(label: str) -> str:
         NonTTYError: If stdin is not a TTY.
     """
     check_tty()
-    result = questionary.password(label).ask()
-    return result if result is not None else ""
+    try:
+        return pt_prompt(label, is_password=True)
+    except (KeyboardInterrupt, EOFError):
+        return ""
 
 
 def prompt_confirm(label: str, default: bool = True) -> bool:

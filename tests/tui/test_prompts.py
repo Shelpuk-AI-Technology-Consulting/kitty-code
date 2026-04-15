@@ -52,22 +52,20 @@ class TestPromptText:
 
 
 class TestPromptSecret:
-    def test_returns_questionary_answer(self) -> None:
-        mock_q = MagicMock()
-        mock_q.ask.return_value = "s3cr3t"
-        with _mock_tty(True), patch("kitty.tui.prompts.questionary") as mock_module:
-            mock_module.password.return_value = mock_q
+    def test_returns_prompt_toolkit_answer(self) -> None:
+        with _mock_tty(True), patch("kitty.tui.prompts.pt_prompt", return_value="s3cr3t") as mock_prompt:
             result = prompt_secret("API key: ")
         assert result == "s3cr3t"
+        mock_prompt.assert_called_once_with("API key: ", is_password=True)
 
     def test_raises_non_tty_error_on_non_tty(self) -> None:
         with _mock_tty(False), pytest.raises(NonTTYError):
             prompt_secret("API key: ")
 
-    def test_questionary_not_called_on_non_tty(self) -> None:
-        with _mock_tty(False), patch("kitty.tui.prompts.questionary") as mock_module, pytest.raises(NonTTYError):
+    def test_prompt_toolkit_not_called_on_non_tty(self) -> None:
+        with _mock_tty(False), patch("kitty.tui.prompts.pt_prompt") as mock_prompt, pytest.raises(NonTTYError):
             prompt_secret("API key: ")
-        mock_module.password.assert_not_called()
+        mock_prompt.assert_not_called()
 
 
 class TestPromptConfirm:

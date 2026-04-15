@@ -75,7 +75,7 @@ def run_setup_wizard(store: ProfileStore, cred_store: CredentialStore) -> Profil
 
     # Step 3: Model
     print_step(3, 6, "Model selection")
-    model = prompt_text("Enter model name: ")
+    model = prompt_text("Model (OpenRouter or provider format, e.g. z-ai/glm-5): ")
     if not model or not model.strip():
         print_error("Model name cannot be empty")
         raise ValueError("Model name cannot be empty")

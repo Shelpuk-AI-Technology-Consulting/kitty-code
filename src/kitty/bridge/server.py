@@ -729,7 +729,7 @@ class BridgeServer:
                                 continue
                         elif self._should_retry_stream(upstream.status, error_body) and attempt < max_attempts - 1:
                             delay = _BACKOFF_BASE * (2 ** (attempt % (_MAX_RETRIES + 1)))
-                            logger.warning(
+                            logger.debug(
                                 "Upstream %d, retrying in %.1fs (%d/%d)",
                                 upstream.status,
                                 delay,
@@ -1276,7 +1276,7 @@ class BridgeServer:
                                 # No healthy backends — fall through to surface error
                             else:
                                 delay = _BACKOFF_BASE * (2 ** (attempt % (_MAX_RETRIES + 1)))
-                                logger.warning(
+                                logger.debug(
                                     "Upstream request failed (%s), retrying in %.1fs (%d/%d)",
                                     type(exc).__name__,
                                     delay,
@@ -1463,7 +1463,7 @@ class BridgeServer:
                                 continue
                         elif self._should_retry_stream(upstream.status, error_body) and attempt < max_attempts - 1:
                             delay = _BACKOFF_BASE * (2 ** (attempt % (_MAX_RETRIES + 1)))
-                            logger.warning(
+                            logger.debug(
                                 "Upstream %d, retrying in %.1fs (%d/%d)",
                                 upstream.status,
                                 delay,
@@ -1841,7 +1841,7 @@ class BridgeServer:
                                 continue
                         elif self._should_retry_stream(upstream.status, error_body) and attempt < max_attempts - 1:
                             delay = _BACKOFF_BASE * (2 ** (attempt % (_MAX_RETRIES + 1)))
-                            logger.warning(
+                            logger.debug(
                                 "Upstream %d, retrying in %.1fs (%d/%d)",
                                 upstream.status,
                                 delay,
@@ -2248,7 +2248,7 @@ class BridgeServer:
 
                 if last_status in _RETRYABLE_STATUSES and attempt < _MAX_RETRIES:
                     delay = _BACKOFF_BASE * (2**attempt)
-                    logger.warning(
+                    logger.debug(
                         "Upstream %d, retrying in %.1fs (%d/%d)",
                         last_status,
                         delay,
