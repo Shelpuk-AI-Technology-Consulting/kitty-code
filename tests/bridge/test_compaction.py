@@ -1,0 +1,440 @@
+"""Tests for context compaction in BridgeServer.
+
+Tests verify that _compact_messages correctly prunes large conversation
+histories to prevent 400 "context too large" errors from upstream providers.
+"""
+
+import json
+
+from kitty.bridge.server import BridgeServer
+from kitty.launchers.base import LauncherAdapter, SpawnConfig
+from kitty.profiles.schema import Profile
+from kitty.providers.base import ProviderAdapter
+from kitty.types import BridgeProtocol
+
+# ── Stub adapters for testing ───────────────────────────────────────────────
+
+
+class StubLauncher(LauncherAdapter):
+    def __init__(self, protocol: BridgeProtocol = BridgeProtocol.MESSAGES_API):
+        self._protocol = protocol
+
+    @property
+    def name(self) -> str:
+        return "stub"
+
+    @property
+    def binary_name(self) -> str:
+        return "stub"
+
+    @property
+    def bridge_protocol(self) -> BridgeProtocol:
+        return self._protocol
+
+    def build_spawn_config(self, profile: Profile, bridge_port: int, resolved_key: str) -> SpawnConfig:
+        return SpawnConfig(env_overrides={}, env_clear=[], cli_args=[])
+
+
+class StubProvider(ProviderAdapter):
+    @property
+    def provider_type(self) -> str:
+        return "stub"
+
+    @property
+    def default_base_url(self) -> str:
+        return "https://api.example.com/v1"
+
+    def build_request(self, model: str, messages: list[dict], **kwargs) -> dict:
+        return {"model": model, "messages": messages, "stream": kwargs.get("stream", False)}
+
+    def parse_response(self, response_data: dict) -> dict:
+        return response_data
+
+    def map_error(self, status_code: int, body: dict) -> Exception:
+        return Exception(f"Upstream error {status_code}: {body}")
+
+
+def _make_server() -> BridgeServer:
+    adapter = StubLauncher()
+    provider = StubProvider()
+    return BridgeServer(adapter, provider, "test-key")
+
+
+# ── Helpers ─────────────────────────────────────────────────────────────────
+
+
+def _make_messages(n: int, start_idx: int = 0) -> list[dict]:
+    """Create n alternating user/assistant messages."""
+    msgs = []
+    for i in range(start_idx, start_idx + n):
+        role = "user" if i % 2 == 0 else "assistant"
+        msgs.append({"role": role, "content": f"Message {i}"})
+    return msgs
+
+
+def _make_tool_call_block(call_id: str, tool_name: str, result_content: str) -> list[dict]:
+    """Create an atomic tool_call + tool_result block."""
+    return [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": call_id, "type": "function", "function": {"name": tool_name, "arguments": "{}"}}
+            ],
+        },
+        {
+            "role": "tool",
+            "content": result_content,
+            "tool_call_id": call_id,
+        },
+    ]
+
+
+def _char_size(messages: list[dict]) -> int:
+    """Estimate serialized character size of messages list."""
+    return len(json.dumps(messages, ensure_ascii=False))
+
+
+def _make_large_messages(count: int, content_multiplier: int = 2000) -> list[dict]:
+    """Create messages large enough to exceed the 2.8M char compaction threshold."""
+    messages = [{"role": "system", "content": "System"}]
+    for i in range(count):
+        role = "user" if i % 2 == 0 else "assistant"
+        messages.append({"role": role, "content": f"Message {i} " * content_multiplier})
+    return messages
+
+
+# ── Tests ───────────────────────────────────────────────────────────────────
+
+
+class TestCompactMessagesBelowThreshold:
+    """When messages are below the compaction threshold, nothing should change."""
+
+    def test_short_history_unchanged(self):
+        server = _make_server()
+        messages = [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi there!"},
+        ]
+        original = json.dumps(messages, ensure_ascii=False)
+
+        result = server._compact_messages(messages.copy())
+
+        assert json.dumps(result, ensure_ascii=False) == original
+
+    def test_empty_messages_unchanged(self):
+        server = _make_server()
+        result = server._compact_messages([])
+        assert result == []
+
+
+class TestCompactMessagesPreservesCriticalMessages:
+    """System message and last user message must always be preserved."""
+
+    def test_system_message_always_preserved(self):
+        server = _make_server()
+        system_msg = {"role": "system", "content": "Critical system prompt " * 1000}
+        # Build a large message list that exceeds threshold
+        messages = [system_msg] + _make_messages(100)
+
+        result = server._compact_messages(messages.copy())
+
+        # System message must be first
+        assert result[0]["role"] == "system"
+        assert result[0]["content"] == system_msg["content"]
+
+    def test_oversized_system_message_still_preserved(self):
+        """System message must be preserved even if it exceeds head_budget alone."""
+        server = _make_server()
+        # System prompt > 560K chars (20% of 2.8M threshold)
+        huge_system = {"role": "system", "content": "S" * 600_000}
+        messages = [huge_system]
+        for i in range(120):
+            role = "user" if i % 2 == 0 else "assistant"
+            messages.append({"role": role, "content": f"Message {i} " * 2000})
+
+        assert _char_size(messages) > 2_800_000
+
+        result = server._compact_messages(messages.copy())
+
+        # System message must survive even though it's larger than head_budget
+        assert result[0]["role"] == "system"
+        assert len(result[0]["content"]) == 600_000
+
+    def test_last_user_message_preserved(self):
+        server = _make_server()
+        last_user = {"role": "user", "content": "This is the critical last question"}
+        messages = _make_messages(100) + [last_user]
+
+        result = server._compact_messages(messages.copy())
+
+        # Find the last user message in result
+        user_msgs = [m for m in result if m["role"] == "user"]
+        assert any(m["content"] == "This is the critical last question" for m in user_msgs)
+
+    def test_system_and_last_user_both_preserved(self):
+        server = _make_server()
+        system_msg = {"role": "system", "content": "System prompt"}
+        last_user = {"role": "user", "content": "Final question"}
+        messages = [system_msg] + _make_messages(100) + [last_user]
+
+        result = server._compact_messages(messages.copy())
+
+        assert result[0]["role"] == "system"
+        assert result[0]["content"] == "System prompt"
+        user_msgs = [m for m in result if m["role"] == "user"]
+        assert any(m["content"] == "Final question" for m in user_msgs)
+
+
+class TestCompactMessagesHeadTail:
+    """Head+Tail compaction: keep head (system+initial) and tail (recent)."""
+
+    def test_reduces_message_count(self):
+        server = _make_server()
+        messages = _make_large_messages(200)
+
+        original_size = _char_size(messages)
+        assert original_size > 2_800_000, f"Test data too small: {original_size}"
+
+        result = server._compact_messages(messages.copy())
+        result_size = _char_size(result)
+
+        assert result_size < original_size
+        assert len(result) < len(messages)
+
+    def test_head_preserves_initial_context(self):
+        server = _make_server()
+        system_msg = {"role": "system", "content": "System"}
+        first_user = {"role": "user", "content": "This is my initial task description " * 100}
+
+        messages = [system_msg, first_user] + _make_messages(200, start_idx=2)
+        # Make messages large enough to trigger compaction
+        for m in messages[2:]:
+            m["content"] = m["content"] + " " * 2000
+
+        result = server._compact_messages(messages.copy())
+
+        # First two messages (system + first user) should be preserved
+        assert result[0]["role"] == "system"
+        assert result[1]["content"].startswith("This is my initial task description")
+
+    def test_tail_preserves_recent_messages(self):
+        server = _make_server()
+        recent_messages = [
+            {"role": "user", "content": "Recent question 1"},
+            {"role": "assistant", "content": "Recent answer 1"},
+            {"role": "user", "content": "Recent question 2"},
+            {"role": "assistant", "content": "Recent answer 2"},
+        ]
+        messages = [{"role": "system", "content": "System"}]
+        for i in range(150):
+            role = "user" if i % 2 == 0 else "assistant"
+            messages.append({"role": role, "content": f"Old message {i} " * 300})
+        messages.extend(recent_messages)
+
+        result = server._compact_messages(messages.copy())
+
+        # Last 4 messages should match the recent_messages
+        for rm, actual in zip(recent_messages, result[-4:], strict=True):
+            assert actual["content"] == rm["content"]
+
+
+class TestCompactMessagesToolResultTruncation:
+    """Large tool results should be truncated to save space."""
+
+    def test_large_tool_result_truncated(self):
+        server = _make_server()
+        large_content = "X" * 100_000
+
+        # Build messages large enough to exceed compaction threshold
+        messages = [
+            {"role": "system", "content": "System"},
+            {"role": "user", "content": "Do something"},
+            {"role": "assistant", "content": "Let me check", "tool_calls": [
+                {"id": "call_123", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}
+            ]},
+            {
+                "role": "tool",
+                "content": large_content,
+                "tool_call_id": "call_123",
+            },
+        ]
+        # Add filler to push total over the 2.8M threshold
+        for i in range(50):
+            messages.append({"role": "user" if i % 2 == 0 else "assistant", "content": "Filler " * 10000})
+
+        assert _char_size(messages) > 2_800_000
+
+        result = server._compact_messages(messages.copy())
+
+        # The tool result should be truncated
+        tool_results = [m for m in result if m["role"] == "tool"]
+        assert len(tool_results) == 1
+        assert len(tool_results[0]["content"]) < 100_000
+        assert "truncated" in tool_results[0]["content"].lower()
+        assert "original size" in tool_results[0]["content"].lower()
+
+    def test_truncation_preserves_tool_call_id(self):
+        server = _make_server()
+        large_content = "Y" * 100_000
+        tool_msg = {
+            "role": "tool",
+            "content": large_content,
+            "tool_call_id": "call_abc_456",
+        }
+
+        messages = [{"role": "system", "content": "System"}, tool_msg]
+        for i in range(50):
+            messages.append({"role": "user" if i % 2 == 0 else "assistant", "content": "Filler " * 10000})
+
+        result = server._compact_messages(messages.copy())
+
+        tool_results = [m for m in result if m["role"] == "tool"]
+        assert len(tool_results) == 1
+        assert tool_results[0]["tool_call_id"] == "call_abc_456"
+
+    def test_small_tool_result_unchanged(self):
+        server = _make_server()
+        small_content = "File contents here"
+        tool_msg = {
+            "role": "tool",
+            "content": small_content,
+            "tool_call_id": "call_123",
+        }
+
+        messages = [
+            {"role": "system", "content": "System"},
+            tool_msg,
+        ]
+
+        result = server._compact_messages(messages.copy())
+
+        tool_results = [m for m in result if m["role"] == "tool"]
+        assert tool_results[0]["content"] == small_content
+
+
+class TestCompactMessagesToolCallAtomicity:
+    """Tool-call + tool-result pairs must never be split by pruning."""
+
+    def test_tool_call_result_pair_kept_together_in_tail(self):
+        """If a tool result is in the tail, its assistant tool_call must also be there."""
+        server = _make_server()
+        block = _make_tool_call_block("call_tail", "read_file", "File content here")
+
+        messages = [{"role": "system", "content": "System"}]
+        for i in range(200):
+            role = "user" if i % 2 == 0 else "assistant"
+            messages.append({"role": role, "content": f"Filler {i} " * 2000})
+        messages.extend(block)
+
+        assert _char_size(messages) > 2_800_000
+
+        result = server._compact_messages(messages.copy())
+
+        # Find the tool result in the output
+        tool_result_idx = None
+        for i, m in enumerate(result):
+            if m.get("role") == "tool" and m.get("tool_call_id") == "call_tail":
+                tool_result_idx = i
+                break
+
+        assert tool_result_idx is not None, "Tool result should be present in compacted output"
+        # The immediately preceding message must be the assistant tool_call
+        assert tool_result_idx > 0
+        assert result[tool_result_idx - 1]["role"] == "assistant"
+        assert result[tool_result_idx - 1].get("tool_calls") is not None
+
+    def test_tool_call_result_pair_kept_together_in_head(self):
+        """If an assistant tool_call is in the head, its tool result must also be there."""
+        server = _make_server()
+        block = _make_tool_call_block("call_head", "list_files", "file1.py\nfile2.py")
+
+        messages = [
+            {"role": "system", "content": "System"},
+        ]
+        messages.extend(block)
+        # Add enough filler after to force compaction
+        for i in range(200):
+            role = "user" if i % 2 == 0 else "assistant"
+            messages.append({"role": role, "content": f"Filler {i} " * 2000})
+
+        assert _char_size(messages) > 2_800_000
+
+        result = server._compact_messages(messages.copy())
+
+        # Find the assistant tool_call in the output
+        tool_call_idx = None
+        for i, m in enumerate(result):
+            if m.get("role") == "assistant" and m.get("tool_calls"):
+                for tc in m["tool_calls"]:
+                    if tc["id"] == "call_head":
+                        tool_call_idx = i
+                        break
+
+        assert tool_call_idx is not None, "Tool call should be preserved in compacted output"
+        # The immediately next message must be the tool result
+        assert tool_call_idx + 1 < len(result)
+        assert result[tool_call_idx + 1]["role"] == "tool"
+        assert result[tool_call_idx + 1]["tool_call_id"] == "call_head"
+
+
+class TestCompactMessagesLogging:
+    """Compaction should log when triggered."""
+
+    def test_logs_compaction_summary(self, caplog):
+        import logging
+        server = _make_server()
+        messages = _make_large_messages(200)
+
+        assert _char_size(messages) > 2_800_000
+
+        with caplog.at_level(logging.INFO, logger="kitty.bridge.server"):
+            server._compact_messages(messages.copy())
+
+        assert any("compaction" in r.message.lower() for r in caplog.records)
+
+
+class TestCompactMessagesEdgeCases:
+    """Edge cases for the compaction logic."""
+
+    def test_single_message_unchanged(self):
+        server = _make_server()
+        messages = [{"role": "user", "content": "Hello"}]
+        result = server._compact_messages(messages.copy())
+        assert len(result) == 1
+        assert result[0]["content"] == "Hello"
+
+    def test_all_messages_fit_unchanged(self):
+        """If all messages fit under threshold, return as-is."""
+        server = _make_server()
+        messages = [
+            {"role": "system", "content": "Short system"},
+            {"role": "user", "content": "Short user"},
+            {"role": "assistant", "content": "Short response"},
+        ]
+        original = json.dumps(messages, ensure_ascii=False)
+
+        result = server._compact_messages(messages.copy())
+
+        assert json.dumps(result, ensure_ascii=False) == original
+
+    def test_messages_with_only_system_and_user(self):
+        """Minimal conversation should pass through unchanged."""
+        server = _make_server()
+        messages = [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "What is 2+2?"},
+        ]
+        result = server._compact_messages(messages.copy())
+        assert len(result) == 2
+
+    def test_no_overlap_between_head_and_tail(self):
+        """Head and tail must not contain duplicate messages."""
+        server = _make_server()
+        messages = _make_large_messages(200)
+
+        result = server._compact_messages(messages.copy())
+
+        # Check no message appears twice (by identity)
+        assert len(result) == len({id(m) for m in result})
