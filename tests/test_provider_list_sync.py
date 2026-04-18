@@ -9,7 +9,6 @@ import pytest
 from kitty.cli.profile_cmd import _create_profile_flow
 from kitty.cli.setup_cmd import run_setup_wizard
 from kitty.profiles.schema import PROVIDER_LABELS, PROVIDER_LIST
-from kitty.providers.registry import _registry
 
 
 class _StopFlow(Exception):

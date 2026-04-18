@@ -2,16 +2,12 @@
 
 import json
 from pathlib import Path
-from unittest.mock import MagicMock, patch
-
-import pytest
 
 from kitty.bridge.server import BridgeServer
 from kitty.launchers.base import LauncherAdapter, SpawnConfig
 from kitty.profiles.schema import Profile
 from kitty.providers.base import ProviderAdapter
 from kitty.types import BridgeProtocol
-
 
 # ── Stubs ───────────────────────────────────────────────────────────────────
 
@@ -74,7 +70,7 @@ class TestCustomUsageLogPath:
         server._log_usage(usage={"prompt_tokens": 10, "completion_tokens": 5})
 
         assert custom_path.exists()
-        entries = [json.loads(l) for l in custom_path.read_text().strip().splitlines()]
+        entries = [json.loads(line) for line in custom_path.read_text().strip().splitlines()]
         assert len(entries) == 1
         assert entries[0]["input_tokens"] == 10
 
@@ -113,7 +109,6 @@ class TestLogFileCLIArg:
 
     def test_log_file_implies_logging_enabled(self):
         """When --log-file is given, logging_enabled should be True even without --logging."""
-        import argparse
 
         from kitty.cli.main import _build_parser
 
@@ -125,7 +120,6 @@ class TestLogFileCLIArg:
         assert effective is True
 
     def test_no_log_file_no_logging(self):
-        import argparse
 
         from kitty.cli.main import _build_parser
 
@@ -135,7 +129,6 @@ class TestLogFileCLIArg:
         assert args.logging is False
 
     def test_log_file_with_explicit_logging(self):
-        import argparse
 
         from kitty.cli.main import _build_parser
 
@@ -145,7 +138,6 @@ class TestLogFileCLIArg:
         assert args.logging is True
 
     def test_logging_without_log_file(self):
-        import argparse
 
         from kitty.cli.main import _build_parser
 

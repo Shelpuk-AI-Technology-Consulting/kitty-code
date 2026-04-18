@@ -5,7 +5,14 @@ from __future__ import annotations
 import uuid
 
 from kitty.credentials.store import CredentialStore
-from kitty.profiles.schema import _NAME_PATTERN, PROVIDER_LABELS, PROVIDER_LIST, RESERVED_NAMES, BalancingProfile, Profile
+from kitty.profiles.schema import (
+    _NAME_PATTERN,
+    PROVIDER_LABELS,
+    PROVIDER_LIST,
+    RESERVED_NAMES,
+    BalancingProfile,
+    Profile,
+)
 from kitty.profiles.store import ProfileStore
 from kitty.tui.display import (
     print_error,
