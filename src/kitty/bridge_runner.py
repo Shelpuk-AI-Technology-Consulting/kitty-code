@@ -144,12 +144,9 @@ def main() -> None:
     async def run() -> None:
         await server.start_async()
         stop_event = asyncio.Event()
-
-        def on_signal(sig: int, frame: object) -> None:
-            stop_event.set()
-
-        signal.signal(signal.SIGTERM, on_signal)
-        signal.signal(signal.SIGINT, on_signal)
+        loop = asyncio.get_running_loop()
+        loop.add_signal_handler(signal.SIGINT, stop_event.set)
+        loop.add_signal_handler(signal.SIGTERM, stop_event.set)
 
         try:
             await stop_event.wait()

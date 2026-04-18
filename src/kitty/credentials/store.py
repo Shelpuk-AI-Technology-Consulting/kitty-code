@@ -39,7 +39,7 @@ class CredentialStore:
         for backend in self._backends:
             value = backend.get(ref)
             if value is not None:
-                return value
+                return value.strip()
         return None
 
     def set(self, ref: str, value: str, backend_index: int = 0) -> None:

@@ -96,6 +96,16 @@ async def validate_api_key(
         warning = f"Cannot reach {provider.provider_type} for key validation: {exc} — proceeding anyway"
         logger.warning(warning)
         return ValidationResult(valid=True, warning=warning)
+    except ValueError:
+        # aiohttp rejects headers containing newlines/carriage returns.
+        # Usually means the stored API key has trailing whitespace.
+        return ValidationResult(
+            valid=False,
+            reason=(
+                f"API key for {provider.provider_type} contains invalid characters "
+                f"(newlines or whitespace).  Re-run `kitty setup` to re-enter your key."
+            ),
+        )
     except (aiohttp.ClientError, OSError) as exc:
         # Client-side HTTP errors (redirect, payload, etc.) — proceed
         warning = f"Key validation network error for {provider.provider_type}: {exc} — proceeding anyway"

@@ -347,12 +347,9 @@ def _run_bridge(
 
         # Set up graceful shutdown
         stop_event = asyncio.Event()
-
-        def signal_handler(sig: int, frame: object) -> None:
-            stop_event.set()
-
-        signal.signal(signal.SIGINT, signal_handler)
-        signal.signal(signal.SIGTERM, signal_handler)
+        loop = asyncio.get_running_loop()
+        loop.add_signal_handler(signal.SIGINT, stop_event.set)
+        loop.add_signal_handler(signal.SIGTERM, stop_event.set)
 
         try:
             await stop_event.wait()
@@ -438,12 +435,9 @@ def _run_bridge_balancing(
         )
 
         stop_event = asyncio.Event()
-
-        def signal_handler(sig: int, frame: object) -> None:
-            stop_event.set()
-
-        signal.signal(signal.SIGINT, signal_handler)
-        signal.signal(signal.SIGTERM, signal_handler)
+        loop = asyncio.get_running_loop()
+        loop.add_signal_handler(signal.SIGINT, stop_event.set)
+        loop.add_signal_handler(signal.SIGTERM, stop_event.set)
 
         try:
             await stop_event.wait()
