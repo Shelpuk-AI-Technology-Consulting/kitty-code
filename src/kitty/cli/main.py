@@ -42,6 +42,13 @@ def _build_parser():
         help="Enable verbose debug logging to ~/.cache/kitty/bridge.log",
     )
     parser.add_argument(
+        "--debug-file",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Write debug logs to PATH instead of ~/.cache/kitty/bridge.log (implies --debug)",
+    )
+    parser.add_argument(
         "--no-validate",
         action="store_true",
         help="Skip pre-flight API key validation",
@@ -246,7 +253,7 @@ def main() -> None:
             sys.exit(1)
         _run_bridge(
             backend, cred_store,
-            debug=args.debug, validate=not args.no_validate,
+            debug=args.debug, debug_file=args.debug_file, validate=not args.no_validate,
             logging_enabled=args.logging or args.log_file is not None,
             usage_log_path=args.log_file,
         )
@@ -254,7 +261,7 @@ def main() -> None:
         backend = result.backend or result.profile
         exit_code = _launch_target(
             result.adapter, backend, cred_store, result.extra_args,
-            debug=args.debug, validate=not args.no_validate,
+            debug=args.debug, debug_file=args.debug_file, validate=not args.no_validate,
             logging_enabled=args.logging or args.log_file is not None,
             usage_log_path=args.log_file,
         )
@@ -295,6 +302,7 @@ def _run_bridge(
     cred_store: object,
     *,
     debug: bool = False,
+    debug_file: Path | None = None,
     validate: bool = True,
     logging_enabled: bool = False,
     usage_log_path: Path | None = None,
@@ -313,7 +321,7 @@ def _run_bridge(
     if isinstance(backend, BalancingProfile):
         _run_bridge_balancing(
             backend, cred_store,
-            debug=debug, validate=validate,
+            debug=debug, debug_file=debug_file, validate=validate,
             logging_enabled=logging_enabled,
             usage_log_path=usage_log_path,
         )
@@ -338,12 +346,13 @@ def _run_bridge(
             pass
 
     # Create bridge server (no adapter for bridge mode — direct Chat Completions API)
+    effective_debug: bool | str = str(debug_file) if debug_file else debug
     server = BridgeServer(
         adapter=None,  # type: ignore[arg-type]
         provider=provider,
         resolved_key=resolved_key,
         model=profile.model,  # type: ignore[union-attr]
-        debug=debug,
+        debug=effective_debug,
         provider_config=getattr(profile, "provider_config", {}),
         logging_enabled=logging_enabled,
         _usage_log_path=usage_log_path,
@@ -391,6 +400,7 @@ def _run_bridge_balancing(
     cred_store: object,
     *,
     debug: bool = False,
+    debug_file: Path | None = None,
     validate: bool = True,
     logging_enabled: bool = False,
     usage_log_path: Path | None = None,
@@ -423,6 +433,7 @@ def _run_bridge_balancing(
         backends.append((provider, key, mp))
 
     # Create bridge server with balancing backends
+    effective_debug: bool | str = str(debug_file) if debug_file else debug
     first_provider = backends[0][0]
     first_key = backends[0][1]
     server = BridgeServer(
@@ -430,7 +441,7 @@ def _run_bridge_balancing(
         provider=first_provider,
         resolved_key=first_key,
         model=member_profiles[0].model,
-        debug=debug,
+        debug=effective_debug,
         provider_config=member_profiles[0].provider_config,
         backends=backends,
         logging_enabled=logging_enabled,
@@ -483,6 +494,7 @@ def _launch_target(
     extra_args: list[str],
     *,
     debug: bool = False,
+    debug_file: Path | None = None,
     validate: bool = True,
     logging_enabled: bool = False,
     usage_log_path: Path | None = None,
@@ -491,10 +503,12 @@ def _launch_target(
     from kitty.profiles.schema import BalancingProfile
     from kitty.providers.registry import get_provider
 
+    effective_debug: bool | str = str(debug_file) if debug_file else debug
+
     if isinstance(backend, BalancingProfile):
         return _launch_target_balancing(
             adapter, backend, cred_store, extra_args,
-            debug=debug, validate=validate, logging_enabled=logging_enabled,
+            debug=effective_debug, validate=validate, logging_enabled=logging_enabled,
             usage_log_path=usage_log_path,
         )
 
@@ -505,7 +519,7 @@ def _launch_target(
         profile=profile,  # type: ignore[arg-type]
         cred_store=cred_store,  # type: ignore[arg-type]
         extra_args=extra_args,
-        debug=debug,
+        debug=effective_debug,
         validate=validate,
         logging_enabled=logging_enabled,
         usage_log_path=usage_log_path,
@@ -518,7 +532,7 @@ def _launch_target_balancing(
     cred_store: object,
     extra_args: list[str],
     *,
-    debug: bool = False,
+    debug: bool | str = False,
     validate: bool = True,
     logging_enabled: bool = False,
     usage_log_path: Path | None = None,

@@ -90,7 +90,7 @@ class BridgeServer:
         port: int = 0,
         *,
         model: str | None = None,
-        debug: bool = False,
+        debug: bool | str = False,
         provider_config: dict | None = None,
         backends: list[tuple[ProviderAdapter, str, Profile]] | None = None,
         access_log_path: str | None = None,
@@ -335,7 +335,10 @@ class BridgeServer:
         if not self._debug:
             return None
 
-        _DEBUG_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        # Resolve effective log path: custom string path or default
+        log_path = Path(self._debug) if isinstance(self._debug, str) else _DEBUG_LOG_PATH
+
+        log_path.parent.mkdir(parents=True, exist_ok=True)
         bridge_logger = logging.getLogger("kitty.bridge")
         bridge_logger.setLevel(logging.DEBUG)
 
@@ -345,7 +348,7 @@ class BridgeServer:
             for h in bridge_logger.handlers
         )
         if not has_bridge_handler:
-            fh = logging.FileHandler(_DEBUG_LOG_PATH, mode="a", encoding="utf-8")
+            fh = logging.FileHandler(log_path, mode="a", encoding="utf-8")
             fh._kitty_bridge_log = True  # type: ignore[attr-defined]
             fh.setLevel(logging.DEBUG)
             fh.setFormatter(
@@ -356,7 +359,7 @@ class BridgeServer:
             )
             bridge_logger.addHandler(fh)
 
-        return _DEBUG_LOG_PATH
+        return log_path
 
     def _log_usage(self, usage: dict | None) -> None:
         """Append a JSONL usage entry to the usage log file.

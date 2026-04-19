@@ -141,6 +141,10 @@ Point your tool at `http://localhost:<port>` and it just works.
 | `kitty <profile> <agent>` | Launch an agent with a specific profile |
 | `kitty <profile> bridge` | Start bridge with a specific profile |
 | `kitty --no-validate <profile> <agent>` | Skip API key validation |
+| `kitty --debug <profile> <agent>` | Enable debug logging to ~/.cache/kitty/bridge.log |
+| `kitty --debug-file /path <profile> <agent>` | Write debug logs to a custom path |
+| `kitty --logging <profile> <agent>` | Enable token usage logging to ~/.cache/kitty/usage.log |
+| `kitty --log-file /path <profile> <agent>` | Write usage logs to a custom path (implies --logging) |
 | `kitty --version` | Print version |
 | `kitty --help` | Print help |
 
@@ -181,6 +185,42 @@ Before launching, kitty validates your API key with a lightweight test request. 
 ```bash
 kitty --no-validate my-profile claude  # skip validation (e.g. air-gapped/offline environments)
 ```
+
+### Logging
+
+kitty has two independent logging streams, each with its own flag and optional custom path.
+
+**Token usage logs** — records prompt/completion token counts per request:
+
+```bash
+# Default location: ~/.cache/kitty/usage.log
+kitty --logging claude
+
+# Custom location
+kitty --log-file /tmp/my-usage.log claude
+```
+
+**Debug logs** — verbose tracing of requests, responses, and protocol translation:
+
+```bash
+# Default location: ~/.cache/kitty/bridge.log
+kitty --debug claude
+
+# Custom location
+kitty --debug-file /tmp/my-debug.log claude
+```
+
+Both flags work in launch mode and bridge mode:
+
+```bash
+kitty --debug --log-file /tmp/usage.log my-profile bridge
+kitty --debug-file /tmp/debug.log --logging my-profile codex
+```
+
+| Flag | What it logs | Default path | Custom path flag |
+|------|-------------|--------------|-----------------|
+| `--logging` | Token usage | `~/.cache/kitty/usage.log` | `--log-file PATH` |
+| `--debug` | Request/response tracing | `~/.cache/kitty/bridge.log` | `--debug-file PATH` |
 
 ### Cleanup
 
