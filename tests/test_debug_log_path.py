@@ -111,10 +111,11 @@ class TestCustomDebugLogPath:
 
     @pytest.fixture(autouse=True)
     def _clean_bridge_logger(self):
-        """Remove any kitty.bridge handlers between tests to avoid cross-contamination."""
+        """Clear kitty.bridge handlers before each test and restore after."""
         bridge_logger = logging.getLogger("kitty.bridge")
         original_handlers = list(bridge_logger.handlers)
         original_level = bridge_logger.level
+        bridge_logger.handlers.clear()
         yield
         bridge_logger.handlers = original_handlers
         bridge_logger.level = original_level
