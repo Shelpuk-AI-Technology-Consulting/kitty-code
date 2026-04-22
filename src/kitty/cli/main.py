@@ -108,6 +108,8 @@ def main() -> None:
 
     if result.builtin == BuiltinCommand.SETUP:
         _run_setup(profile_store, cred_store)
+    elif result.builtin == BuiltinCommand.AUTH:
+        _run_auth(profile_store, cred_store, result.extra_args)
     elif result.builtin == BuiltinCommand.PROFILE:
         _run_profile_menu(profile_store, cred_store)
     elif result.builtin == BuiltinCommand.DOCTOR:
@@ -269,6 +271,17 @@ def main() -> None:
     else:
         parser.print_help()
         sys.exit(1)
+
+
+def _run_auth(profile_store: object, cred_store: object, extra_args: list[str]) -> None:
+    from kitty.cli.auth_cmd import run_auth_openai
+
+    args = extra_args or []
+    if not args or args[0] == "openai":
+        import asyncio
+        asyncio.run(run_auth_openai(profile_store, cred_store))  # type: ignore[arg-type]
+    else:
+        print(f"Unknown auth provider: {args[0]!r}")
 
 
 def _run_setup(profile_store: object, cred_store: object) -> None:

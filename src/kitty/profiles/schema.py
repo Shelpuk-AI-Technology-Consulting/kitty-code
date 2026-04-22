@@ -23,6 +23,7 @@ _PROVIDER_TYPES = Literal[
     "novita",
     "ollama",
     "openai",
+    "openai_subscription",
     "openrouter",
     "anthropic",
     "bedrock",
@@ -42,6 +43,7 @@ PROVIDER_LABELS: dict[str, str] = {
     "google_aistudio": "Google AI Studio",
     "kimi": "Kimi Code",
     "mimo": "Xiaomi MiMo",
+    "openai_subscription": "OpenAI ChatGPT (subscription)",
 }
 
 

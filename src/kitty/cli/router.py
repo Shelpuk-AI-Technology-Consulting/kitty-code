@@ -17,6 +17,7 @@ class BuiltinCommand(str, Enum):
     """Built-in CLI commands."""
 
     SETUP = "setup"
+    AUTH = "auth"
     PROFILE = "profile"
     DOCTOR = "doctor"
     CLEANUP = "cleanup"

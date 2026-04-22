@@ -15,6 +15,7 @@ from kitty.providers.minimax import MiniMaxAdapter
 from kitty.providers.novita import NovitaAdapter
 from kitty.providers.ollama import OllamaAdapter
 from kitty.providers.openai import OpenAIAdapter
+from kitty.providers.openai_subscription import OpenAISubscriptionAdapter
 from kitty.providers.opencode import OpenCodeGoAdapter
 from kitty.providers.openrouter import OpenRouterAdapter
 from kitty.providers.vertex import VertexAIAdapter
@@ -27,6 +28,7 @@ _registry: dict[str, type[ProviderAdapter]] = {
     "novita": NovitaAdapter,
     "ollama": OllamaAdapter,
     "openai": OpenAIAdapter,
+    "openai_subscription": OpenAISubscriptionAdapter,
     "openrouter": OpenRouterAdapter,
     "anthropic": AnthropicAdapter,
     "bedrock": BedrockAdapter,
