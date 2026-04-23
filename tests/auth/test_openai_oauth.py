@@ -304,17 +304,26 @@ class TestExchangeIdTokenForApiKey:
     async def test_exchange_id_token_payload_is_correct(self) -> None:
         """Token-exchange POST body has grant_type, requested_token, subject_token, subject_token_type."""
         captured_body: dict[str, Any] = {}
+        captured_headers: dict[str, str] = {}
         id_token = "my-id-token-xyz"
+        access_token = "my-access-token-abc"
+
+        def capture(url, **kw):
+            _capture_body(captured_body, kw)
+            if "headers" in kw:
+                captured_headers.update(kw["headers"])
 
         with aioresponses() as m:
             m.post(
                 OAUTH_TOKEN_URL,
-                callback=lambda url, **kw: _capture_body(captured_body, kw),
+                callback=capture,
                 payload={"openai_api_key": "sk-exchanged-key-123"},
             )
 
             async with aiohttp.ClientSession() as http:
-                result = await _exchange_id_token_for_api_key(id_token, CLIENT_ID, http)
+                result = await _exchange_id_token_for_api_key(
+                    id_token, access_token, CLIENT_ID, http
+                )
 
         assert result == "sk-exchanged-key-123"
         assert captured_body.get("grant_type") == TOKEN_EXCHANGE_GRANT
@@ -322,6 +331,7 @@ class TestExchangeIdTokenForApiKey:
         assert captured_body.get("subject_token") == id_token
         assert captured_body.get("subject_token_type") == ID_TOKEN_TYPE
         assert captured_body.get("client_id") == CLIENT_ID
+        assert captured_headers.get("Authorization") == f"Bearer {access_token}"
 
 
 # ── run_oauth_flow integration ─────────────────────────────────────────────

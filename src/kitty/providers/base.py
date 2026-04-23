@@ -13,6 +13,12 @@ class ProviderAdapter(ABC):
     response payloads but do not perform HTTP calls themselves.
     """
 
+    # Internal metadata keys that must never be sent upstream.
+    _INTERNAL_KEYS = frozenset({
+        "_reasoning_effort", "_thinking_enabled",
+        "_resolved_key", "_provider_config", "_original_body",
+    })
+
     @property
     @abstractmethod
     def provider_type(self) -> str:
@@ -105,8 +111,9 @@ class ProviderAdapter(ABC):
     def translate_to_upstream(self, cc_request: dict) -> dict:
         """Translate a normalized CC request into the upstream wire format.
 
-        Default returns the request unchanged (passthrough).  Override for
-        providers whose upstream API differs from Chat Completions.
+        Default strips internal metadata keys and returns the rest unchanged
+        (passthrough).  Override for providers whose upstream API differs from
+        Chat Completions.
 
         Args:
             cc_request: Fully normalized Chat Completions request dict.
@@ -114,7 +121,7 @@ class ProviderAdapter(ABC):
         Returns:
             Dict to send as JSON body to the upstream endpoint.
         """
-        return cc_request
+        return {k: v for k, v in cc_request.items() if k not in self._INTERNAL_KEYS}
 
     def translate_from_upstream(self, raw_response: dict) -> dict:
         """Translate an upstream JSON response into Chat Completions format.
@@ -173,6 +180,16 @@ class ProviderAdapter(ABC):
         models with 401 instead of 400).
         """
         return "test"
+
+    @property
+    def requires_oauth(self) -> bool:
+        """Whether this provider uses OAuth instead of a static API key.
+
+        Override in providers that authenticate via a browser-based OAuth flow
+        (e.g. OpenAI ChatGPT subscription).  When True, profile creation
+        wizards launch the OAuth flow instead of prompting for an API key.
+        """
+        return False
 
     @property
     def use_custom_transport(self) -> bool:

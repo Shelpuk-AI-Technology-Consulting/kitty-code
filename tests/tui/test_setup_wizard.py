@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import uuid
 from contextlib import contextmanager
-from unittest.mock import patch
+from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from kitty.auth.oauth_session import OAuthSession
 from kitty.cli.setup_cmd import run_setup_wizard
 from kitty.credentials.file_backend import FileBackend
 from kitty.credentials.store import CredentialStore
@@ -172,3 +175,67 @@ class TestRunSetupWizard:
             patch(f"{_MOD}.SelectionMenu.show", return_value=None),pytest.raises(NonTTYError)
         ):
             run_setup_wizard(store, cred_store)
+
+
+# ---------------------------------------------------------------------------
+# OAuth provider path in setup wizard
+# ---------------------------------------------------------------------------
+
+def _make_oauth_session() -> OAuthSession:
+    return OAuthSession(
+        client_id="app_test",
+        access_token="at_test",
+        refresh_token="rt_test",
+        id_token="id_test",
+        api_key="sk-test-oauth-key",
+        access_token_expires_at=9999999999.0,
+        api_key_expires_at=9999999999.0,
+        _file_path=None,
+    )
+
+
+def _mock_run_oauth_for_provider(session: OAuthSession):
+    """Create an async mock for run_oauth_for_provider."""
+    async def _fake(profile_store, cred_store, provider):
+        auth_ref = str(uuid.uuid4())
+        config_dir = profile_store._path.parent
+        persisted = OAuthSession.create_session_file(session, auth_ref, config_dir)
+        cred_store.set(auth_ref, str(persisted._file_path))
+        return auth_ref, str(persisted._file_path)
+    return AsyncMock(side_effect=_fake)
+
+
+class TestSetupWizardOAuth:
+    def test_oauth_provider_launches_browser_not_key_prompt(self, store: ProfileStore, cred_store: CredentialStore) -> None:
+        """When openai_subscription is selected, OAuth flow runs instead of API key prompt."""
+        session = _make_oauth_session()
+
+        with (
+            _mock_tty(),
+            patch(f"{_MOD}.SelectionMenu.show", return_value="OpenAI ChatGPT (subscription)"),
+            patch("kitty.cli.auth_cmd.run_oauth_for_provider", _mock_run_oauth_for_provider(session)),
+            patch(f"{_MOD}.prompt_text", side_effect=["gpt-5.3-codex", "my-openai"]),
+            patch(f"{_MOD}.prompt_confirm", side_effect=[False]),  # set_default, no conn check
+            patch(f"{_MOD}.prompt_secret") as mock_secret,
+        ):
+            profile = run_setup_wizard(store, cred_store)
+
+        assert profile.provider == "openai_subscription"
+        assert profile.model == "gpt-5.3-codex"
+        assert profile.name == "my-openai"
+        mock_secret.assert_not_called()  # no API key prompt
+
+    def test_oauth_provider_uses_default_model(self, store: ProfileStore, cred_store: CredentialStore) -> None:
+        """OAuth provider uses default model when user enters empty string."""
+        session = _make_oauth_session()
+
+        with (
+            _mock_tty(),
+            patch(f"{_MOD}.SelectionMenu.show", return_value="OpenAI ChatGPT (subscription)"),
+            patch("kitty.cli.auth_cmd.run_oauth_for_provider", _mock_run_oauth_for_provider(session)),
+            patch(f"{_MOD}.prompt_text", side_effect=["", "openai-prof"]),
+            patch(f"{_MOD}.prompt_confirm", side_effect=[False]),
+        ):
+            profile = run_setup_wizard(store, cred_store)
+
+        assert profile.model == "gpt-5.3-codex"

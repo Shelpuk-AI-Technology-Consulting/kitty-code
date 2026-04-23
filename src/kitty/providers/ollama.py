@@ -143,11 +143,7 @@ class OllamaAdapter(ProviderAdapter):
         return {
             k: v
             for k, v in cc_request.items()
-            if k
-            not in (
-                "_resolved_key",
-                "_provider_config",
-            )
+            if k not in self._INTERNAL_KEYS
         }
 
     def translate_from_upstream(self, raw_response: dict) -> dict:

@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
-from unittest.mock import patch
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from kitty.auth.oauth_session import OAuthSession
 from kitty.credentials.file_backend import FileBackend
 from kitty.credentials.store import CredentialStore
 from kitty.profiles.schema import BalancingProfile, Profile
@@ -483,3 +486,133 @@ class TestDeleteCredentialCleanup:
 
         assert store.get("p1") is None
         assert cred_store.get(shared_ref) == "shared-key"  # preserved — p2 still needs it
+
+
+# ---------------------------------------------------------------------------
+# OAuth provider create flow
+# ---------------------------------------------------------------------------
+
+def _make_oauth_session() -> OAuthSession:
+    return OAuthSession(
+        client_id="app_test",
+        access_token="at_test",
+        refresh_token="rt_test",
+        id_token="id_test",
+        api_key="sk-test-oauth-key",
+        access_token_expires_at=9999999999.0,
+        api_key_expires_at=9999999999.0,
+        _file_path=None,
+    )
+
+
+def _mock_run_oauth_for_provider(session: OAuthSession):
+    """Create an async mock for run_oauth_for_provider."""
+    async def _fake(profile_store, cred_store, provider):
+        auth_ref = str(uuid.uuid4())
+        config_dir = profile_store._path.parent
+        persisted = OAuthSession.create_session_file(session, auth_ref, config_dir)
+        cred_store.set(auth_ref, str(persisted._file_path))
+        return auth_ref, str(persisted._file_path)
+    return AsyncMock(side_effect=_fake)
+
+
+class TestCreateProfileFlowOAuth:
+    def test_oauth_provider_skips_api_key_prompt(self, store: ProfileStore, cred_store: CredentialStore) -> None:
+        """When provider requires OAuth, no API key prompt appears; OAuth flow runs instead."""
+        create = _import_create_profile_flow()
+        session = _make_oauth_session()
+
+        with (
+            patch("kitty.cli.profile_cmd.SelectionMenu.show", return_value="OpenAI ChatGPT (subscription)"),
+            patch("kitty.cli.auth_cmd.run_oauth_for_provider", _mock_run_oauth_for_provider(session)),
+            patch("kitty.cli.profile_cmd.prompt_text", side_effect=["gpt-5.3-codex", "my-oauth-profile"]),
+            patch("kitty.cli.profile_cmd.prompt_confirm", return_value=True),
+            patch("kitty.cli.profile_cmd.prompt_secret") as mock_secret,
+        ):
+            profile = create(store, cred_store)
+
+        assert profile.provider == "openai_subscription"
+        assert profile.model == "gpt-5.3-codex"
+        assert profile.name == "my-oauth-profile"
+        mock_secret.assert_not_called()  # no API key prompt
+
+    def test_oauth_provider_uses_default_model(self, store: ProfileStore, cred_store: CredentialStore) -> None:
+        """OAuth provider uses default model when user enters empty string."""
+        create = _import_create_profile_flow()
+        session = _make_oauth_session()
+
+        with (
+            patch("kitty.cli.profile_cmd.SelectionMenu.show", return_value="OpenAI ChatGPT (subscription)"),
+            patch("kitty.cli.auth_cmd.run_oauth_for_provider", _mock_run_oauth_for_provider(session)),
+            patch("kitty.cli.profile_cmd.prompt_text", side_effect=["", "oauth-profile"]),
+            patch("kitty.cli.profile_cmd.prompt_confirm", return_value=True),
+        ):
+            profile = create(store, cred_store)
+
+        assert profile.model == "gpt-5.3-codex"
+
+    def test_oauth_provider_session_file_is_accessible(
+        self, store: ProfileStore, cred_store: CredentialStore
+    ) -> None:
+        """Credential store holds a path to an existing session file for OAuth profiles."""
+        create = _import_create_profile_flow()
+        session = _make_oauth_session()
+
+        with (
+            patch("kitty.cli.profile_cmd.SelectionMenu.show", return_value="OpenAI ChatGPT (subscription)"),
+            patch("kitty.cli.auth_cmd.run_oauth_for_provider", _mock_run_oauth_for_provider(session)),
+            patch("kitty.cli.profile_cmd.prompt_text", side_effect=["gpt-5.3-codex", "oauth-prof"]),
+            patch("kitty.cli.profile_cmd.prompt_confirm", return_value=True),
+        ):
+            profile = create(store, cred_store)
+
+        session_path = cred_store.get(profile.auth_ref)
+        assert session_path is not None
+        assert Path(session_path).exists()
+
+
+# ---------------------------------------------------------------------------
+# OAuth provider edit flow
+# ---------------------------------------------------------------------------
+
+class TestEditProfileFlowOAuth:
+    def test_shows_reauthenticate_for_oauth_provider(self, store: ProfileStore, cred_store: CredentialStore) -> None:
+        """Edit menu shows 'Re-authenticate' instead of 'API Key' for OAuth providers."""
+        edit = _import_edit_profile_flow()
+        session = _make_oauth_session()
+
+        p = _make_profile("oauth-prof", provider="openai_subscription", model="gpt-5.3-codex")
+        store.save(p)
+        cred_store.set(p.auth_ref, "/fake/path.json")
+
+        with (
+            patch("kitty.cli.profile_cmd.SelectionMenu.show", side_effect=[
+                "Re-authenticate",  # field selection
+            ]),
+            patch("kitty.cli.auth_cmd.run_oauth_for_provider", _mock_run_oauth_for_provider(session)),
+            patch("kitty.cli.profile_cmd.prompt_secret") as mock_secret,
+        ):
+            edit(store, cred_store, "oauth-prof")
+
+        saved = store.get("oauth-prof")
+        assert saved is not None
+        assert saved.auth_ref != p.auth_ref  # new auth_ref from OAuth
+        mock_secret.assert_not_called()  # no API key prompt for OAuth providers
+
+    def test_edit_model_for_oauth_provider(self, store: ProfileStore, cred_store: CredentialStore) -> None:
+        """Editing just the model works for OAuth providers."""
+        edit = _import_edit_profile_flow()
+        p = _make_profile("oauth-prof", provider="openai_subscription", model="old-model")
+        store.save(p)
+        old_auth_ref = p.auth_ref
+
+        with (
+            patch("kitty.cli.profile_cmd.SelectionMenu.show", return_value="Model"),
+            patch("kitty.cli.profile_cmd.prompt_text", return_value="new-model"),
+        ):
+            edit(store, cred_store, "oauth-prof")
+
+        saved = store.get("oauth-prof")
+        assert saved is not None
+        assert saved.model == "new-model"
+        assert saved.auth_ref == old_auth_ref

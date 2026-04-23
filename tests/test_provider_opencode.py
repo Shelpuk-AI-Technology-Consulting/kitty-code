@@ -247,7 +247,7 @@ class TestOpenCodeGoChatCompletionsPassthrough:
     def test_translate_to_upstream_passthrough_for_cc_model(self):
         cc = {"model": "glm-5", "messages": SAMPLE_MESSAGES, "stream": True}
         result = self.adapter.translate_to_upstream(cc)
-        assert result is cc
+        assert result == cc
 
     def test_translate_from_upstream_passthrough_for_cc_response(self):
         resp = SAMPLE_CC_RESPONSE
@@ -388,7 +388,7 @@ class TestOpenCodeGoMessagesTranslateToUpstream:
         """Non-messages models should pass through without Anthropic translation."""
         cc = {"model": "glm-5", "messages": CC_MESSAGES_BASIC, "stream": True}
         result = self.adapter.translate_to_upstream(cc)
-        assert result is cc  # same object, passthrough
+        assert result == cc  # same content, passthrough
 
 
 class TestOpenCodeGoMessagesTranslateFromUpstream:

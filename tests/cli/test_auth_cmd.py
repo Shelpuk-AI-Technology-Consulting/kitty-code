@@ -15,8 +15,9 @@ from kitty.credentials.file_backend import FileBackend
 from kitty.credentials.store import CredentialStore
 from kitty.profiles.store import ProfileStore
 
-# Module path for patching
+# Module paths for patching
 _MOD = "kitty.cli.auth_cmd"
+_HELPER_MOD = "kitty.cli.auth_cmd.run_oauth_for_provider"
 
 
 @contextmanager
@@ -50,33 +51,76 @@ def _make_oauth_session() -> OAuthSession:
     )
 
 
-def _mock_questionary_text(responses):
-    """Create a mock for questionary.text().ask() returning given responses.
+def _mock_run_oauth_for_provider(session: OAuthSession):
+    """Create an async mock for run_oauth_for_provider that returns (auth_ref, path)."""
+    async def _fake_run(profile_store, cred_store, provider):
+        import uuid
+        auth_ref = str(uuid.uuid4())
+        config_dir = profile_store._path.parent
+        persisted = OAuthSession.create_session_file(session, auth_ref, config_dir)
+        session_path = str(persisted._file_path)
+        cred_store.set(auth_ref, session_path)
+        return auth_ref, session_path
 
-    questionary.text("label", default="x").ask() is a chain of calls:
-      1. questionary.text("label", default="x") -> question object
-      2. .ask() -> string response
-
-    We mock questionary.text to return an object whose ask() returns the next response.
-    """
-    call_count = 0
-
-    def _text_factory(*args, **kwargs):
-        nonlocal call_count
-        idx = call_count
-        call_count += 1
-        mock_q = MagicMock()
-        mock_q.ask.return_value = responses[idx]
-        return mock_q
-
-    return MagicMock(side_effect=_text_factory)
+    return AsyncMock(side_effect=_fake_run)
 
 
-def _mock_questionary_confirm(response=True):
-    """Create a mock for questionary.confirm().ask()."""
-    mock_q = MagicMock()
-    mock_q.ask.return_value = response
-    return MagicMock(return_value=mock_q)
+class TestRunOauthForProvider:
+    def test_creates_session_file_and_stores_path(
+        self, store: ProfileStore, cred_store: CredentialStore
+    ) -> None:
+        """run_oauth_for_provider creates a session file and stores the path."""
+        session = _make_oauth_session()
+
+        with (
+            _mock_tty(),
+            patch(f"{_MOD}.run_oauth_flow", new=AsyncMock(return_value=session)),
+        ):
+            from kitty.cli.auth_cmd import run_oauth_for_provider
+
+            auth_ref, session_path = asyncio.run(
+                run_oauth_for_provider(store, cred_store, "openai_subscription")
+            )
+
+        assert auth_ref is not None
+        stored_path = cred_store.get(auth_ref)
+        assert stored_path == session_path
+        assert Path(session_path).exists()
+
+    def test_raises_on_oauth_failure(
+        self, store: ProfileStore, cred_store: CredentialStore
+    ) -> None:
+        """OAuth flow failure is printed and re-raised."""
+
+        class OAuthFailure(Exception):
+            pass
+
+        with (
+            _mock_tty(),
+            patch(f"{_MOD}.run_oauth_flow", new=AsyncMock(side_effect=OAuthFailure("Browser not available"))),
+            patch(f"{_MOD}.print_error") as mock_error,
+        ):
+            from kitty.cli.auth_cmd import run_oauth_for_provider
+
+            with pytest.raises(OAuthFailure):
+                asyncio.run(
+                    run_oauth_for_provider(store, cred_store, "openai_subscription")
+                )
+
+        mock_error.assert_called()
+        assert "OAuth flow failed" in mock_error.call_args[0][0]
+
+    def test_non_tty_raises(self) -> None:
+        """Non-TTY environment raises NonTTYError."""
+        from kitty.tui.prompts import NonTTYError
+
+        with patch("sys.stdin.isatty", return_value=False):
+            from kitty.cli.auth_cmd import run_oauth_for_provider
+
+            with pytest.raises(NonTTYError):
+                asyncio.run(
+                    run_oauth_for_provider(store, cred_store, "openai_subscription")
+                )
 
 
 class TestAuthOpenaiProfileCreation:
@@ -88,9 +132,9 @@ class TestAuthOpenaiProfileCreation:
 
         with (
             _mock_tty(),
-            patch(f"{_MOD}.run_oauth_flow", new=AsyncMock(return_value=session)),
-            patch(f"{_MOD}.questionary.text", _mock_questionary_text(["gpt-5.3-codex", "my-openai-profile"])),
-            patch(f"{_MOD}.questionary.confirm", _mock_questionary_confirm(True)),
+            patch(f"{_MOD}.run_oauth_for_provider", _mock_run_oauth_for_provider(session)),
+            patch(f"{_MOD}.prompt_text", side_effect=["gpt-5.3-codex", "my-openai-profile"]),
+            patch(f"{_MOD}.prompt_confirm", return_value=True),
             patch("kitty.validation.validate_api_key", new=AsyncMock(return_value=MagicMock(valid=True))),
         ):
             from kitty.cli.auth_cmd import run_auth_openai
@@ -115,9 +159,9 @@ class TestAuthOpenaiProfileCreation:
 
         with (
             _mock_tty(),
-            patch(f"{_MOD}.run_oauth_flow", new=AsyncMock(return_value=session)),
-            patch(f"{_MOD}.questionary.text", _mock_questionary_text(["gpt-5.3-codex", "openai-sub"])),
-            patch(f"{_MOD}.questionary.confirm", _mock_questionary_confirm(True)),
+            patch(f"{_MOD}.run_oauth_for_provider", _mock_run_oauth_for_provider(session)),
+            patch(f"{_MOD}.prompt_text", side_effect=["gpt-5.3-codex", "openai-sub"]),
+            patch(f"{_MOD}.prompt_confirm", return_value=True),
             patch("kitty.validation.validate_api_key", new=AsyncMock(return_value=MagicMock(valid=True))),
         ):
             from kitty.cli.auth_cmd import run_auth_openai
@@ -140,14 +184,14 @@ class TestAuthOpenaiProfileCreation:
     def test_auth_cmd_asks_for_model_and_profile_name(
         self, store: ProfileStore, cred_store: CredentialStore
     ) -> None:
-        """Command prompts for model name and profile name via questionary."""
+        """Command prompts for model name and profile name via prompt_text."""
         session = _make_oauth_session()
 
         with (
             _mock_tty(),
-            patch(f"{_MOD}.run_oauth_flow", new=AsyncMock(return_value=session)),
-            patch(f"{_MOD}.questionary.text", _mock_questionary_text(["custom-model", "my-profile"])),
-            patch(f"{_MOD}.questionary.confirm", _mock_questionary_confirm(False)),
+            patch(f"{_MOD}.run_oauth_for_provider", _mock_run_oauth_for_provider(session)),
+            patch(f"{_MOD}.prompt_text", side_effect=["custom-model", "my-profile"]),
+            patch(f"{_MOD}.prompt_confirm", return_value=False),
             patch("kitty.validation.validate_api_key", new=AsyncMock(return_value=MagicMock(valid=True))),
         ):
             from kitty.cli.auth_cmd import run_auth_openai
@@ -161,18 +205,15 @@ class TestAuthOpenaiProfileCreation:
     def test_auth_cmd_uses_default_model_and_profile_name(
         self, store: ProfileStore, cred_store: CredentialStore
     ) -> None:
-        """When user accepts defaults (presses Enter), gpt-5.3-codex and openai-sub are used.
-
-        questionary.text with a default returns the default value when user presses Enter.
-        """
+        """When user accepts defaults (presses Enter), gpt-5.3-codex and openai-sub are used."""
         session = _make_oauth_session()
 
-        # Simulate questionary returning defaults (as it does when user presses Enter)
+        # Simulate empty inputs → defaults used
         with (
             _mock_tty(),
-            patch(f"{_MOD}.run_oauth_flow", new=AsyncMock(return_value=session)),
-            patch(f"{_MOD}.questionary.text", _mock_questionary_text(["gpt-5.3-codex", "openai-sub"])),
-            patch(f"{_MOD}.questionary.confirm", _mock_questionary_confirm(False)),
+            patch(f"{_MOD}.run_oauth_for_provider", _mock_run_oauth_for_provider(session)),
+            patch(f"{_MOD}.prompt_text", side_effect=["", ""]),
+            patch(f"{_MOD}.prompt_confirm", return_value=False),
             patch("kitty.validation.validate_api_key", new=AsyncMock(return_value=MagicMock(valid=True))),
         ):
             from kitty.cli.auth_cmd import run_auth_openai
@@ -185,24 +226,19 @@ class TestAuthOpenaiProfileCreation:
     def test_auth_cmd_raises_if_oauth_flow_fails(
         self, store: ProfileStore, cred_store: CredentialStore
     ) -> None:
-        """OAuth flow failure is printed and re-raised."""
+        """OAuth flow failure propagates to caller."""
 
         class OAuthFailure(Exception):
             pass
 
         with (
             _mock_tty(),
-            patch(f"{_MOD}.run_oauth_flow", new=AsyncMock(side_effect=OAuthFailure("Browser not available"))),
-            patch(f"{_MOD}.print_error") as mock_error,
+            patch(f"{_MOD}.run_oauth_for_provider", new=AsyncMock(side_effect=OAuthFailure("Browser not available"))),
         ):
             from kitty.cli.auth_cmd import run_auth_openai
 
             with pytest.raises(OAuthFailure):
                 asyncio.run(run_auth_openai(store, cred_store))
-
-        mock_error.assert_called()
-        error_call = mock_error.call_args[0][0]
-        assert "OpenAI OAuth flow failed" in error_call
 
     def test_auth_cmd_validation_failure_warns_but_creates_profile(
         self, store: ProfileStore, cred_store: CredentialStore
@@ -216,9 +252,9 @@ class TestAuthOpenaiProfileCreation:
 
         with (
             _mock_tty(),
-            patch(f"{_MOD}.run_oauth_flow", new=AsyncMock(return_value=session)),
-            patch(f"{_MOD}.questionary.text", _mock_questionary_text(["gpt-5.3-codex", "test-profile"])),
-            patch(f"{_MOD}.questionary.confirm", _mock_questionary_confirm(True)),
+            patch(f"{_MOD}.run_oauth_for_provider", _mock_run_oauth_for_provider(session)),
+            patch(f"{_MOD}.prompt_text", side_effect=["gpt-5.3-codex", "test-profile"]),
+            patch(f"{_MOD}.prompt_confirm", return_value=True),
             patch("kitty.validation.validate_api_key", new=AsyncMock(return_value=validation_result)),
             patch(f"{_MOD}.print_warning") as mock_warn,
         ):

@@ -85,16 +85,8 @@ class AzureOpenAIAdapter(ProviderAdapter):
         and strips internal metadata fields.
         """
         # Shallow copy to avoid mutating the original
-        result = {
-            k: v
-            for k, v in cc_request.items()
-            if k
-            not in (
-                "model",
-                "_resolved_key",
-                "_provider_config",
-            )
-        }
+        strip = self._INTERNAL_KEYS | {"model"}
+        result = {k: v for k, v in cc_request.items() if k not in strip}
         return result
 
     def translate_from_upstream(self, raw_response: dict) -> dict:

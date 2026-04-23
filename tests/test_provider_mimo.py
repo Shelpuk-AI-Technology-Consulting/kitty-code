@@ -28,7 +28,7 @@ class TestMimoAdapter:
         assert self.adapter.provider_type == "mimo"
 
     def test_default_base_url(self):
-        assert self.adapter.default_base_url == "https://api.xiaomimimo.com/v1"
+        assert self.adapter.default_base_url == "https://token-plan-ams.xiaomimimo.com/v1"
 
     def test_validation_model(self):
         assert self.adapter.validation_model == "mimo-v2-pro"

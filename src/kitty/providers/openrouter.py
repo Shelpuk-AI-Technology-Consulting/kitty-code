@@ -53,3 +53,10 @@ class OpenRouterAdapter(ProviderAdapter):
     def map_error(self, status_code: int, body: dict) -> Exception:
         error_msg = body.get("error", {}) if isinstance(body.get("error"), dict) else body.get("error", "Unknown error")
         return ProviderError(f"OpenRouter error {status_code}: {error_msg}")
+
+    def translate_to_upstream(self, cc_request: dict) -> dict:
+        result = {k: v for k, v in cc_request.items() if k not in self._INTERNAL_KEYS}
+        effort = cc_request.get("_reasoning_effort")
+        if effort and effort != "none":
+            result["reasoning"] = {"effort": effort}
+        return result

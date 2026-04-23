@@ -121,10 +121,14 @@ class MessagesTranslator:
             if key in messages_request:
                 result[key] = messages_request[key]
 
-        # Strip thinking config and warn once
-        if "thinking" in messages_request and not self._thinking_warned:
-            self._thinking_warned = True
-            # thinking is intentionally NOT passed to upstream
+        # Extract thinking config into normalized effort metadata
+        thinking = messages_request.get("thinking")
+        if thinking and isinstance(thinking, dict):
+            if not self._thinking_warned:
+                self._thinking_warned = True
+            if thinking.get("type") == "enabled":
+                result["_thinking_enabled"] = True
+                result["_reasoning_effort"] = "high"
 
         return result
 

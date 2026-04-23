@@ -7,12 +7,13 @@ import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
-import aiohttp
 import pytest
-from aioresponses import aioresponses
 
 from kitty.auth.oauth_session import OAuthSession
-from kitty.providers.openai_subscription import OpenAISubscriptionAdapter
+from kitty.providers.openai_subscription import (
+    OpenAISubscriptionAdapter,
+    _CODEX_BACKEND_URL,
+)
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────
@@ -22,16 +23,32 @@ def adapter() -> OpenAISubscriptionAdapter:
     return OpenAISubscriptionAdapter()
 
 
+def _make_id_token(account_id: str | None = None) -> str:
+    """Build a minimal JWT id_token with an optional chatgpt_account_id."""
+    header = "eyJhbGciOiJIUzI1NiJ9"
+    payload_dict: dict = {}
+    if account_id is not None:
+        payload_dict["https://api.openai.com/auth"] = {
+            "chatgpt_account_id": account_id,
+        }
+    payload_json = json.dumps(payload_dict)
+    import base64
+    payload = base64.urlsafe_b64encode(payload_json.encode()).rstrip(b"=").decode()
+    signature = "fake_sig"
+    return f"{header}.{payload}.{signature}"
+
+
 @pytest.fixture()
 def fresh_session(tmp_path: Path) -> tuple[OAuthSession, Path]:
     """Create a fresh OAuthSession file (tokens not expired)."""
     now = time.time()
+    id_token = _make_id_token("acct-1234")
     session = OAuthSession(
         client_id="app_test",
         access_token="at_fresh",
         refresh_token="rt_fresh",
-        id_token="id_fresh",
-        api_key="sk-test-fresh-key",
+        id_token=id_token,
+        api_key=None,
         access_token_expires_at=now + 3600,
         api_key_expires_at=now + 3600,
         _file_path=str(tmp_path / "oauth_session.json"),
@@ -45,28 +62,51 @@ def cc_request(fresh_session: tuple[OAuthSession, Path]) -> dict:
     """A typical cc_request with _resolved_key pointing to the session file."""
     _, session_path = fresh_session
     return {
-        "model": "gpt-5.3-codex",
-        "messages": [{"role": "user", "content": "Hello"}],
+        "model": "gpt-5.4",
+        "messages": [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "Hello"},
+        ],
         "stream": False,
+        "tools": [
+            {
+                "function": {
+                    "name": "bash",
+                    "description": "Run a shell command",
+                    "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}},
+                },
+                "type": "function",
+            }
+        ],
         "_resolved_key": str(session_path),
         "_provider_config": {},
     }
 
 
-UPSTREAM_RESPONSE = {
-    "id": "chatcmpl-test123",
-    "object": "chat.completion",
-    "created": 0,
-    "model": "gpt-5.3-codex",
-    "choices": [
-        {
-            "index": 0,
-            "message": {"role": "assistant", "content": "Hello! How can I help?"},
-            "finish_reason": "stop",
-        }
-    ],
-    "usage": {"prompt_tokens": 10, "completion_tokens": 8, "total_tokens": 18},
-}
+@pytest.fixture()
+def responses_body() -> dict:
+    """A typical Responses API request body."""
+    return {
+        "model": "gpt-5.4",
+        "instructions": "You are helpful.",
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Hello"}],
+            }
+        ],
+        "stream": True,
+        "tools": [
+            {
+                "type": "function",
+                "name": "bash",
+                "description": "Run a shell command",
+                "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}},
+                "strict": True,  # Should be stripped
+            }
+        ],
+    }
 
 
 # ── Properties ──────────────────────────────────────────────────────────────
@@ -78,120 +118,111 @@ class TestProperties:
     def test_use_custom_transport(self, adapter: OpenAISubscriptionAdapter) -> None:
         assert adapter.use_custom_transport is True
 
-    def test_default_base_url(self, adapter: OpenAISubscriptionAdapter) -> None:
-        assert adapter.default_base_url == "https://api.openai.com/v1"
+    def test_default_base_url_is_codex_backend(self, adapter: OpenAISubscriptionAdapter) -> None:
+        assert adapter.default_base_url == _CODEX_BACKEND_URL
+        assert "chatgpt.com" in adapter.default_base_url
 
     def test_normalize_model_name_strips_prefix(self, adapter: OpenAISubscriptionAdapter) -> None:
-        assert adapter.normalize_model_name("openai/gpt-5.3-codex") == "gpt-5.3-codex"
+        assert adapter.normalize_model_name("openai/gpt-5.4") == "gpt-5.4"
 
     def test_normalize_model_name_no_prefix(self, adapter: OpenAISubscriptionAdapter) -> None:
-        assert adapter.normalize_model_name("gpt-5.3-codex") == "gpt-5.3-codex"
+        assert adapter.normalize_model_name("gpt-5.4") == "gpt-5.4"
 
 
-# ── make_request ────────────────────────────────────────────────────────
+# ── Helpers ──────────────────────────────────────────────────────────────
 
-class TestMakeRequest:
-    @pytest.mark.asyncio
-    async def test_sends_correct_api_key(
-        self, adapter: OpenAISubscriptionAdapter, cc_request: dict
-    ) -> None:
-        with aioresponses() as m:
-            m.post(
-                "https://api.openai.com/v1/chat/completions",
-                status=200,
-                payload=UPSTREAM_RESPONSE,
-            )
+class TestExtractAccountId:
+    def test_extracts_account_id_from_jwt(self) -> None:
+        token = _make_id_token("my-acct-123")
+        assert OpenAISubscriptionAdapter._extract_account_id(token) == "my-acct-123"
 
-            result = await adapter.make_request(cc_request)
+    def test_returns_none_if_missing(self) -> None:
+        token = _make_id_token(None)
+        assert OpenAISubscriptionAdapter._extract_account_id(token) is None
 
-        assert result["choices"][0]["message"]["content"] == "Hello! How can I help?"
-        # Verify the request was made with the correct API key
-        # (aioresponses doesn't easily expose request headers, so we check the result)
+    def test_returns_none_on_garbage(self) -> None:
+        assert OpenAISubscriptionAdapter._extract_account_id("not-a-jwt") is None
 
-    @pytest.mark.asyncio
-    async def test_returns_cc_format_response(
-        self, adapter: OpenAISubscriptionAdapter, cc_request: dict
-    ) -> None:
-        with aioresponses() as m:
-            m.post(
-                "https://api.openai.com/v1/chat/completions",
-                status=200,
-                payload=UPSTREAM_RESPONSE,
-            )
 
-            result = await adapter.make_request(cc_request)
-
-        assert "choices" in result
-        assert result["choices"][0]["message"]["content"] == "Hello! How can I help?"
-        assert result["choices"][0]["finish_reason"] == "stop"
-
-    @pytest.mark.asyncio
-    async def test_raises_provider_error_on_500(
-        self, adapter: OpenAISubscriptionAdapter, cc_request: dict
-    ) -> None:
-        from kitty.providers.base import ProviderError
-
-        with aioresponses() as m:
-            m.post(
-                "https://api.openai.com/v1/chat/completions",
-                status=500,
-                payload={"error": {"message": "Internal server error"}},
-            )
-
-            with pytest.raises(ProviderError) as exc_info:
-                await adapter.make_request(cc_request)
-            assert "500" in str(exc_info.value)
-
-    @pytest.mark.asyncio
-    async def test_401_triggers_reauth_message(
-        self, adapter: OpenAISubscriptionAdapter, cc_request: dict
-    ) -> None:
-        from kitty.providers.base import ProviderError
-
-        # Create an expired session so the re-auth attempt also fails
-        _, session_path = cc_request["_resolved_key"], cc_request.get("_resolved_key")
-        # The session is fresh (expires in 3600s), so 401 will trigger re-exchange
-        # which will also fail (since we mock a second 401)
-        with aioresponses() as m:
-            # First request: 401
-            m.post(
-                "https://api.openai.com/v1/chat/completions",
-                status=401,
-                payload={"error": {"message": "Invalid API key", "code": "invalid_api_key"}},
-            )
-            # Re-exchange token (to auth.openai.com) also fails
-            m.post(
-                "https://auth.openai.com/oauth/token",
-                status=400,
-                payload={"error": "invalid_grant"},
-            )
-
-            with pytest.raises(ProviderError) as exc_info:
-                await adapter.make_request(cc_request)
-            assert "re-authenticate" in str(exc_info.value).lower() or "invalid" in str(exc_info.value).lower()
-
-    @pytest.mark.asyncio
-    async def test_raises_on_missing_session_file(
-        self, adapter: OpenAISubscriptionAdapter
-    ) -> None:
-        cc_req = {
-            "model": "gpt-5.3-codex",
-            "messages": [{"role": "user", "content": "test"}],
-            "stream": False,
-            "_resolved_key": "/nonexistent/path/session.json",
-            "_provider_config": {},
+class TestPrepareResponsesBody:
+    def test_strips_strict_from_tools(self) -> None:
+        body = {
+            "tools": [
+                {"type": "function", "name": "bash", "strict": True, "parameters": {}},
+            ],
         }
-        with pytest.raises(FileNotFoundError):
-            await adapter.make_request(cc_req)
+        result = OpenAISubscriptionAdapter._prepare_responses_body(body)
+        assert "strict" not in result["tools"][0]
+
+    def test_sets_store_false(self) -> None:
+        body = {}
+        result = OpenAISubscriptionAdapter._prepare_responses_body(body)
+        assert result["store"] is False
+
+    def test_sets_stream_true(self) -> None:
+        body = {}
+        result = OpenAISubscriptionAdapter._prepare_responses_body(body)
+        assert result["stream"] is True
+
+
+class TestCcToResponses:
+    def test_converts_system_message_to_instructions(self, adapter: OpenAISubscriptionAdapter) -> None:
+        cc = {
+            "model": "gpt-5.4",
+            "messages": [
+                {"role": "system", "content": "Be helpful."},
+                {"role": "user", "content": "Hi"},
+            ],
+        }
+        result = adapter._cc_to_responses(cc)
+        assert result["instructions"] == "Be helpful."
+        assert len(result["input"]) == 1
+        assert result["input"][0]["role"] == "user"
+
+    def test_converts_tools(self, adapter: OpenAISubscriptionAdapter) -> None:
+        cc = {
+            "model": "gpt-5.4",
+            "messages": [{"role": "user", "content": "test"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "bash",
+                        "description": "Run command",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+        }
+        result = adapter._cc_to_responses(cc)
+        assert len(result["tools"]) == 1
+        assert result["tools"][0]["name"] == "bash"
+        assert "function" not in result["tools"][0]
+
+    def test_does_not_include_max_output_tokens(self, adapter: OpenAISubscriptionAdapter) -> None:
+        """The Codex backend rejects max_output_tokens with 400."""
+        cc = {
+            "model": "gpt-5.4",
+            "messages": [{"role": "user", "content": "test"}],
+            "max_tokens": 4096,
+        }
+        result = adapter._cc_to_responses(cc)
+        assert "max_output_tokens" not in result
+        assert "max_tokens" not in result
 
 
 # ── map_error ─────────────────────────────────────────────────────────────
 
 class TestMapError:
-    def test_map_error_includes_status_and_body(self, adapter: OpenAISubscriptionAdapter) -> None:
+    def test_map_error_429_rate_limited(self, adapter: OpenAISubscriptionAdapter) -> None:
         error = adapter.map_error(429, {"error": {"message": "Rate limited"}})
-        assert "429" in str(error)
+        assert "rate limited" in str(error).lower()
         assert "Rate limited" in str(error)
+
+    def test_map_error_400_includes_status(self, adapter: OpenAISubscriptionAdapter) -> None:
+        error = adapter.map_error(400, {"error": {"message": "Bad request"}})
+        assert "400" in str(error)
+        assert "Bad request" in str(error)
 
     def test_map_error_401_mentions_reauth(self, adapter: OpenAISubscriptionAdapter) -> None:
         error = adapter.map_error(401, {"error": {"message": "Unauthorized", "code": "invalid_api_key"}})

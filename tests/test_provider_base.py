@@ -84,7 +84,7 @@ class TestTranslateToUpstreamDefault:
         adapter = _stub_adapter()
         cc = {"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}], "stream": False}
         result = adapter.translate_to_upstream(cc)
-        assert result is cc  # same object — passthrough
+        assert result == cc  # same content — passthrough (filters internal metadata keys)
 
 
 class TestTranslateFromUpstreamDefault:

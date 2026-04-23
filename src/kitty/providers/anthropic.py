@@ -121,6 +121,12 @@ class AnthropicAdapter(ProviderAdapter):
         if "tools" in cc_request and cc_request["tools"]:
             anthropic["tools"] = self._translate_tools(cc_request["tools"])
 
+        # Restore thinking from normalized effort metadata
+        if cc_request.get("_thinking_enabled"):
+            anthropic["thinking"] = {"type": "enabled", "budget_tokens": 10000}
+        elif cc_request.get("_thinking_enabled") is False:
+            anthropic["thinking"] = {"type": "disabled"}
+
         return anthropic
 
     def _translate_assistant_msg(self, msg: dict) -> dict:

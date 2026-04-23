@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -22,6 +23,9 @@ _DEFAULT_EXPIRES_IN = 3600
 
 # Proactive refresh margin (seconds before expiry)
 _REFRESH_MARGIN_SECONDS = 60
+
+# HTTP timeout for OAuth token operations
+_OAUTH_TIMEOUT = aiohttp.ClientTimeout(total=30)
 
 
 class OAuthError(Exception):
@@ -60,10 +64,15 @@ class OAuthSession:
     access_token: str
     refresh_token: str
     id_token: str
-    api_key: str
+    api_key: str | None
     access_token_expires_at: float  # epoch seconds
     api_key_expires_at: float  # epoch seconds
     _file_path: str | None = field(default=None, repr=False)
+    _refresh_lock: asyncio.Lock = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        if self._refresh_lock is None:
+            object.__setattr__(self, "_refresh_lock", asyncio.Lock())
 
     # ── Factory from token endpoint response ─────────────────────────────────
 
@@ -85,7 +94,7 @@ class OAuthSession:
             access_token=payload["access_token"],
             refresh_token=payload["refresh_token"],
             id_token=payload["id_token"],
-            api_key=payload["api_key"],
+            api_key=payload.get("api_key"),
             access_token_expires_at=now + expires_in,
             api_key_expires_at=now + expires_in,
             _file_path=None,
@@ -113,7 +122,7 @@ class OAuthSession:
             access_token=data["access_token"],
             refresh_token=data["refresh_token"],
             id_token=data["id_token"],
-            api_key=data["api_key"],
+            api_key=data.get("api_key"),
             access_token_expires_at=data["access_token_expires_at"],
             api_key_expires_at=data["api_key_expires_at"],
             _file_path=data.get("_file_path"),  # may be absent in old files
@@ -136,9 +145,10 @@ class OAuthSession:
         path = Path(self._file_path)
         tmp = path.with_suffix(".tmp")
         tmp.write_text(json.dumps(self.to_dict(), indent=2), encoding="utf-8")
+        # Set restrictive permissions before rename to avoid a brief
+        # world-readable window between the replace() and chmod().
+        tmp.chmod(0o600)
         tmp.replace(path)
-        # Set restrictive permissions (owner only)
-        path.chmod(0o600)
         logger.debug("OAuth session saved to %s", path)
 
     @classmethod
@@ -184,14 +194,15 @@ class OAuthSession:
         """Refresh tokens using the refresh_token grant.
 
         After successful refresh, updates access_token, refresh_token, id_token,
-        and expiry times. Also re-exchanges for a new API key.
+        and expiry times. Attempts to re-exchange for a new API key (best-effort;
+        failure is logged but does not block the session). Persists the updated
+        session to disk.
 
         Args:
             http: aiohttp session for HTTP calls.
 
         Raises:
             OAuthRefreshFailed: If the refresh grant fails.
-            OAuthTokenExchangeFailed: If the API key re-exchange fails.
         """
         # Step 1: Refresh tokens using refresh_token grant
         refresh_payload = {
@@ -199,14 +210,17 @@ class OAuthSession:
             "refresh_token": self.refresh_token,
             "client_id": self.client_id,
         }
-        async with http.post(OAUTH_TOKEN_URL, data=refresh_payload) as resp:
-            if resp.status == 400:
-                body = await resp.json()
+        async with http.post(OAUTH_TOKEN_URL, data=refresh_payload, timeout=_OAUTH_TIMEOUT) as resp:
+            if resp.status >= 400:
+                body = {}
+                try:
+                    body = await resp.json()
+                except Exception:
+                    pass
                 raise OAuthRefreshFailed(
-                    body.get("error", "invalid_grant"),
+                    body.get("error", f"HTTP {resp.status}"),
                     body.get("error_description"),
                 )
-            resp.raise_for_status()
             tokens = await resp.json()
 
         self.access_token = tokens["access_token"]
@@ -215,10 +229,22 @@ class OAuthSession:
         expires_in = tokens.get("expires_in", _DEFAULT_EXPIRES_IN)
         self.access_token_expires_at = time.time() + expires_in
 
-        # Step 2: Re-exchange id_token for a new API key
-        api_key = await self._exchange_api_key(http)
-        self.api_key = api_key
+        # Step 2: Re-exchange id_token for a new API key (best-effort).
+        # Fails for org accounts without Platform API org mapping — in that
+        # case we use the access_token directly as Bearer auth.
+        try:
+            api_key = await self._exchange_api_key(http)
+            self.api_key = api_key
+        except OAuthTokenExchangeFailed:
+            logger.warning(
+                "API key exchange failed during refresh; using access_token directly"
+            )
+            self.api_key = None
         self.api_key_expires_at = time.time() + expires_in
+
+        # Persist immediately after successful refresh
+        if self._file_path:
+            self.save()
 
         logger.info("OAuth tokens refreshed successfully")
 
@@ -241,53 +267,55 @@ class OAuthSession:
             "subject_token_type": ID_TOKEN_TYPE,
             "client_id": self.client_id,
         }
-        async with http.post(OAUTH_TOKEN_URL, data=payload) as resp:
+        async with http.post(OAUTH_TOKEN_URL, data=payload, timeout=_OAUTH_TIMEOUT) as resp:
             if resp.status >= 400:
-                body = await resp.json()
+                body = {}
+                try:
+                    body = await resp.json()
+                except Exception:
+                    pass
                 raise OAuthTokenExchangeFailed(
                     body.get("error", "token_exchange_failed"),
                     body.get("error_description"),
                 )
-            resp.raise_for_status()
             result = await resp.json()
         return result["openai_api_key"]
 
     # ── Public API ─────────────────────────────────────────────────────────
 
-    async def get_valid_api_key(self, http: aiohttp.ClientSession) -> str:
-        """Return a valid API key, refreshing tokens if needed.
+    async def get_valid_api_key(
+        self, http: aiohttp.ClientSession, *, force_refresh: bool = False
+    ) -> str:
+        """Return a valid bearer token, refreshing if needed.
 
-        Returns the api_key after checking expiry. If the access token is
-        expired or within the proactive refresh margin, performs a full
-        refresh + re-exchange before returning.
+        Returns the exchanged API key if available; otherwise falls back to the
+        access_token (used for ChatGPT subscription accounts where the
+        API-key exchange is not available).
 
         Args:
             http: aiohttp session for HTTP calls.
+            force_refresh: If True, skip expiry checks and force a token refresh
+                (used when the API key has been rejected with 401).
 
         Returns:
-            A valid OpenAI API key string.
+            A valid bearer token string (api_key or access_token).
 
         Raises:
             OAuthRefreshFailed: If refresh fails and cannot be recovered.
-            OAuthTokenExchangeFailed: If API key exchange fails.
         """
-        if not self.access_token_expired and not self.api_key_expired and not self._should_proactive_refresh:
-            return self.api_key
+        async with self._refresh_lock:
+            # Re-check after acquiring the lock — another coroutine may have refreshed
+            if not force_refresh and not self.access_token_expired and not self.api_key_expired and not self._should_proactive_refresh:
+                return self.api_key or self.access_token
 
-        try:
-            await self._refresh(http)
-        except OAuthRefreshFailed:
-            raise
-        except OAuthTokenExchangeFailed:
-            raise
-        except Exception as exc:
-            raise OAuthRefreshFailed(
-                "refresh_failed",
-                f"Network or unexpected error during token refresh: {exc}",
-            ) from exc
+            try:
+                await self._refresh(http)
+            except OAuthRefreshFailed:
+                raise
+            except Exception as exc:
+                raise OAuthRefreshFailed(
+                    "refresh_failed",
+                    f"Network or unexpected error during token refresh: {exc}",
+                ) from exc
 
-        # Persist the updated session to disk after refresh
-        if self._file_path:
-            self.save()
-
-        return self.api_key
+            return self.api_key or self.access_token

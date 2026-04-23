@@ -67,6 +67,24 @@ $ kitty claude
   > Hello! How can I help you today?
 ```
 
+### Example: Use your ChatGPT subscription with Claude Code
+
+```bash
+$ pip install kitty-bridge
+$ kitty setup
+  ? Provider: openai_subscription
+  ? Model: gpt-5.4
+
+  Opening browser for OpenAI authentication...
+
+$ kitty claude
+  ✓ Bridge running on port <random_port>
+  ✓ Claude Code launched
+  > Hello! How can I help you today?
+```
+
+No API key required — kitty authenticates with your ChatGPT Plus or Pro account through a browser-based OAuth flow. Each profile gets its own independent session.
+
 ### Example: Use MiMo V2 Pro with Claude Code
 
 ```bash
@@ -142,6 +160,7 @@ Point your tool at `http://localhost:<port>` and it just works.
 | Provider | Type ID | Notes |
 |----------|---------|-------|
 | OpenAI | `openai` | |
+| OpenAI ChatGPT Subscription | `openai_subscription` | Uses your ChatGPT Plus/Pro subscription via OAuth — no API key needed |
 | Anthropic | `anthropic` | Direct Anthropic Messages API |
 | OpenRouter | `openrouter` | Multi-provider router |
 | MiniMax | `minimax` | |

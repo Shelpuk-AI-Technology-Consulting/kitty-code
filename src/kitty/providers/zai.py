@@ -61,6 +61,16 @@ class _ZaiBase(ProviderAdapter):
         error_msg = body.get("error", {}) if isinstance(body.get("error"), dict) else body.get("error", "Unknown error")
         return ProviderError(f"Z.AI {self._PROVIDER_TYPE} error {status_code}: {error_msg}")
 
+    def translate_to_upstream(self, cc_request: dict) -> dict:
+        result = {k: v for k, v in cc_request.items() if k not in self._INTERNAL_KEYS}
+        effort = cc_request.get("_reasoning_effort")
+        thinking = cc_request.get("_thinking_enabled")
+        if effort and effort != "none" or thinking:
+            result["thinking"] = {"type": "enabled"}
+        elif thinking is False or effort == "none":
+            result["thinking"] = {"type": "disabled"}
+        return result
+
 
 class ZaiRegularAdapter(_ZaiBase):
     """Z.AI regular API adapter."""

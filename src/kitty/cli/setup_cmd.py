@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 
 from kitty.credentials.store import CredentialStore
@@ -54,35 +55,55 @@ def run_setup_wizard(store: ProfileStore, cred_store: CredentialStore) -> Profil
     if provider is None:
         raise NonTTYError("Provider selection cancelled")
 
-    # Step 2: API key — offer reuse if a same-provider profile exists
-    print_step(2, 6, "API key")
-    existing_auth_ref = _find_reusable_auth_ref(store, cred_store, provider)
-    if existing_auth_ref is not None:
-        reuse = prompt_confirm(f"Reuse existing API key for {provider!r}?", default=True)
-        if reuse:
-            auth_ref = existing_auth_ref
+    # Step 2: Credential — OAuth flow or API key depending on provider
+    from kitty.providers.registry import get_provider as _get_provider
+    provider_adapter = _get_provider(provider)
+
+    if provider_adapter.requires_oauth:
+        print_step(2, 6, "OAuth login")
+        from kitty.cli.auth_cmd import run_oauth_for_provider
+
+        auth_ref, _session_path = asyncio.run(
+            run_oauth_for_provider(store, cred_store, provider)
+        )
+    else:
+        print_step(2, 6, "API key")
+        existing_auth_ref = _find_reusable_auth_ref(store, cred_store, provider)
+        if existing_auth_ref is not None:
+            reuse = prompt_confirm(f"Reuse existing API key for {provider!r}?", default=True)
+            if reuse:
+                auth_ref = existing_auth_ref
+            else:
+                api_key = prompt_secret("Enter new API key: ")
+                if not api_key:
+                    print_error("API key cannot be empty")
+                    raise ValueError("API key cannot be empty")
+                auth_ref = str(uuid.uuid4())
+                cred_store.set(auth_ref, api_key)
         else:
-            api_key = prompt_secret("Enter new API key: ")
+            api_key = prompt_secret("Enter API key: ")
             if not api_key:
                 print_error("API key cannot be empty")
                 raise ValueError("API key cannot be empty")
             auth_ref = str(uuid.uuid4())
             cred_store.set(auth_ref, api_key)
-    else:
-        api_key = prompt_secret("Enter API key: ")
-        if not api_key:
-            print_error("API key cannot be empty")
-            raise ValueError("API key cannot be empty")
-        auth_ref = str(uuid.uuid4())
-        cred_store.set(auth_ref, api_key)
 
     # Step 3: Model
     print_step(3, 6, "Model selection")
-    model = prompt_text("Model (OpenRouter or provider format, e.g. z-ai/glm-5): ")
-    if not model or not model.strip():
-        print_error("Model name cannot be empty")
-        raise ValueError("Model name cannot be empty")
-    model = model.strip()
+    _default_models = {"openai_subscription": "gpt-5.3-codex"}
+    default_model = _default_models.get(provider)
+    if default_model:
+        model = prompt_text(f"Model (default: {default_model}): ")
+        if not model or not model.strip():
+            model = default_model
+        else:
+            model = model.strip()
+    else:
+        model = prompt_text("Model (OpenRouter or provider format, e.g. z-ai/glm-5): ")
+        if not model or not model.strip():
+            print_error("Model name cannot be empty")
+            raise ValueError("Model name cannot be empty")
+        model = model.strip()
 
     # Step 4: Profile name (validated)
     print_step(4, 6, "Profile name")

@@ -15,7 +15,7 @@ class MimoAdapter(ProviderAdapter):
     """Xiaomi MiMo adapter (OpenAI-compatible).
 
     MiMo provides an OpenAI-compatible Chat Completions API at
-    ``https://api.xiaomimimo.com/v1``.
+    ``https://token-plan-ams.xiaomimimo.com/v1`` (subscription plan endpoint).
     API keys are obtained from https://platform.xiaomimimo.com/#/console/api-keys
     """
 
@@ -25,7 +25,7 @@ class MimoAdapter(ProviderAdapter):
 
     @property
     def default_base_url(self) -> str:
-        return "https://api.xiaomimimo.com/v1"
+        return "https://token-plan-ams.xiaomimimo.com/v1"
 
     @property
     def validation_model(self) -> str:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 
 from kitty.credentials.store import CredentialStore
@@ -140,33 +141,54 @@ def _create_profile_flow(store: ProfileStore, cred_store: CredentialStore) -> Pr
     if provider in _label_to_type:
         provider = _label_to_type[provider]
 
-    # Step 2: API key — offer reuse if a same-provider profile exists
-    existing_auth_ref = _find_reusable_auth_ref(store, cred_store, provider)
-    if existing_auth_ref is not None:
-        reuse = prompt_confirm(f"Reuse existing API key for {provider!r}?", default=True)
-        if reuse:
-            auth_ref = existing_auth_ref
+    # Step 2: Credential — OAuth flow or API key depending on provider
+    from kitty.providers.registry import get_provider as _get_provider
+    provider_adapter = _get_provider(provider)
+
+    if provider_adapter.requires_oauth:
+        # OAuth path: launch browser flow
+        from kitty.cli.auth_cmd import run_oauth_for_provider
+
+        auth_ref, _session_path = asyncio.run(
+            run_oauth_for_provider(store, cred_store, provider)
+        )
+    else:
+        # API key path — offer reuse if a same-provider profile exists
+        existing_auth_ref = _find_reusable_auth_ref(store, cred_store, provider)
+        if existing_auth_ref is not None:
+            reuse = prompt_confirm(f"Reuse existing API key for {provider!r}?", default=True)
+            if reuse:
+                auth_ref = existing_auth_ref
+            else:
+                api_key = prompt_secret("Enter new API key: ")
+                if not api_key:
+                    print_error("API key cannot be empty")
+                    raise ValueError("API key cannot be empty")
+                auth_ref = str(uuid.uuid4())
+                cred_store.set(auth_ref, api_key)
         else:
-            api_key = prompt_secret("Enter new API key: ")
+            api_key = prompt_secret("Enter API key: ")
             if not api_key:
                 print_error("API key cannot be empty")
                 raise ValueError("API key cannot be empty")
             auth_ref = str(uuid.uuid4())
             cred_store.set(auth_ref, api_key)
-    else:
-        api_key = prompt_secret("Enter API key: ")
-        if not api_key:
-            print_error("API key cannot be empty")
-            raise ValueError("API key cannot be empty")
-        auth_ref = str(uuid.uuid4())
-        cred_store.set(auth_ref, api_key)
 
     # Step 3: Model
-    model = prompt_text("Model (OpenRouter or provider format, e.g. z-ai/glm-5): ")
-    if not model or not model.strip():
-        print_error("Model name cannot be empty")
-        raise ValueError("Model name cannot be empty")
-    model = model.strip()
+    _default_models = {"openai_subscription": "gpt-5.3-codex"}
+    default_model = _default_models.get(provider)
+    if default_model:
+        model = prompt_text(f"Model (default: {default_model}): ")
+        if not model or not model.strip():
+            model = default_model
+        else:
+            model = model.strip()
+    else:
+        model = prompt_text("Model (OpenRouter or provider format, e.g. z-ai/glm-5): ")
+        if not model or not model.strip():
+            print_error("Model name cannot be empty")
+            raise ValueError("Model name cannot be empty")
+        model = model.strip()
 
     # Step 4: Profile name
     is_first = len(store.get_all_backends()) == 0
@@ -254,7 +276,8 @@ def _create_balancing_flow(store: ProfileStore) -> BalancingProfile:
 def _edit_profile_flow(store: ProfileStore, cred_store: CredentialStore, profile_name: str) -> None:
     """Interactive flow for editing an existing regular profile.
 
-    Allows changing the model name, the API key (copy-on-write), or both.
+    For API-key providers: allows changing the model name and API key.
+    For OAuth providers: allows changing the model and re-running OAuth.
 
     Args:
         store: Profile store.
@@ -266,9 +289,15 @@ def _edit_profile_flow(store: ProfileStore, cred_store: CredentialStore, profile
         print_error(f"Profile {profile_name!r} not found")
         return
 
+    from kitty.providers.registry import get_provider as _get_provider
+    provider_adapter = _get_provider(profile.provider)
+    is_oauth = provider_adapter.requires_oauth
+
+    credential_label = "Re-authenticate" if is_oauth else "API Key"
+    options = ["Model", credential_label, "Both"]
     field = SelectionMenu(
         f"Edit profile {profile_name!r} — what to change?",
-        ["Model", "API Key", "Both"],
+        options,
     ).show()
     if field is None:
         return
@@ -280,15 +309,24 @@ def _edit_profile_flow(store: ProfileStore, cred_store: CredentialStore, profile
         if new_model and new_model.strip():
             updates["model"] = new_model.strip()
 
-    if field in ("API Key", "Both"):
-        new_key = prompt_secret("Enter new API key: ")
-        if new_key:
-            # Copy-on-write: always create a fresh auth_ref for the edited profile.
-            # The old credential entry is left untouched so other profiles sharing
-            # the same auth_ref continue to work.
-            new_auth_ref = str(uuid.uuid4())
-            cred_store.set(new_auth_ref, new_key)
+    if field in (credential_label, "Both"):
+        if is_oauth:
+            # Re-run OAuth flow to get fresh session
+            from kitty.cli.auth_cmd import run_oauth_for_provider
+
+            new_auth_ref, _new_session_path = asyncio.run(
+                run_oauth_for_provider(store, cred_store, profile.provider)
+            )
             updates["auth_ref"] = new_auth_ref
+        else:
+            new_key = prompt_secret("Enter new API key: ")
+            if new_key:
+                # Copy-on-write: always create a fresh auth_ref for the edited profile.
+                # The old credential entry is left untouched so other profiles sharing
+                # the same auth_ref continue to work.
+                new_auth_ref = str(uuid.uuid4())
+                cred_store.set(new_auth_ref, new_key)
+                updates["auth_ref"] = new_auth_ref
 
     if updates:
         updated = profile.model_copy(update=updates)

@@ -112,7 +112,7 @@ class OpenCodeGoAdapter(ProviderAdapter):
         model = cc_request.get("model", "")
         if _is_messages_model(model):
             return self._translate_to_anthropic(cc_request)
-        return cc_request
+        return {k: v for k, v in cc_request.items() if k not in self._INTERNAL_KEYS}
 
     def translate_from_upstream(self, raw_response: dict) -> dict:
         # Anthropic responses have a "type" field; CC responses have "object"

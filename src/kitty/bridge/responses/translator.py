@@ -157,6 +157,13 @@ class ResponsesTranslator:
             if key in responses_request:
                 result[key] = responses_request[key]
 
+        # Extract reasoning effort
+        reasoning = responses_request.get("reasoning")
+        if isinstance(reasoning, dict) and "effort" in reasoning:
+            effort = reasoning["effort"]
+            result["_reasoning_effort"] = effort
+            result["_thinking_enabled"] = effort != "none"
+
         return result
 
     @staticmethod

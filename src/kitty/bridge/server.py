@@ -17,7 +17,15 @@ import aiohttp
 from aiohttp import web
 
 from kitty.bridge.gemini.translator import GeminiTranslator
-from kitty.bridge.messages.events import format_error_event as messages_format_error
+from kitty.bridge.messages.events import (
+    format_content_block_delta_event,
+    format_content_block_start_event,
+    format_content_block_stop_event,
+    format_error_event as messages_format_error,
+    format_message_delta_event,
+    format_message_start_event,
+    format_message_stop_event,
+)
 from kitty.bridge.messages.translator import MessagesTranslator
 from kitty.bridge.responses.events import (
     format_error_event as responses_format_error,
@@ -650,6 +658,11 @@ class BridgeServer:
         if cc_request.get("stream"):
             return await self._stream_responses(request, body, translator, cc_request)
 
+        # For custom-transport providers, attach the original Responses API body
+        # so the provider can forward it directly without CC round-trip translation.
+        if self._active_provider.use_custom_transport:
+            cc_request["_original_body"] = body
+
         try:
             cc_response = await self._request_with_retry(cc_request)
         except UpstreamError as exc:
@@ -683,6 +696,24 @@ class BridgeServer:
             headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"},
         )
         await sr.prepare(request)
+
+        # Custom-transport providers handle their own HTTP requests.
+        # For Responses API, pass the original body so the provider can
+        # forward it directly without CC round-trip translation.
+        if self._active_provider.use_custom_transport:
+            cc_request["_resolved_key"] = self._active_key
+            cc_request["_provider_config"] = self._active_provider_config
+            cc_request["_original_body"] = body
+            try:
+                await self._active_provider.stream_request(cc_request, sr.write)
+            except Exception:
+                raise
+            finally:
+                try:
+                    await sr.write_eof()
+                except (ConnectionResetError, BrokenPipeError, OSError):
+                    logger.debug("Client disconnected before stream EOF")
+            return sr
 
         # Emit response.created and response.in_progress via translator
         start_events = translator.translate_stream_start(response_id, model)
@@ -1043,6 +1074,126 @@ class BridgeServer:
         await sr.prepare(request)
 
         last_usage: dict | None = None
+
+        # Custom-transport providers (e.g. openai_subscription) return
+        # Responses API SSE.  We must collect the raw stream, parse it into
+        # a Chat Completions response, translate to Messages API format, and
+        # emit proper SSE events to the client.
+        if self._active_provider.use_custom_transport:
+            cc_request["_resolved_key"] = self._active_key
+            cc_request["_provider_config"] = self._active_provider_config
+
+            raw_chunks: list[bytes] = []
+
+            async def _collect(chunk: bytes) -> None:
+                raw_chunks.append(chunk)
+
+            try:
+                await self._active_provider.stream_request(cc_request, _collect)
+            except Exception:
+                raise
+
+            # Parse Responses API SSE → Chat Completions response
+            raw_bytes = b"".join(raw_chunks)
+            logger.debug(
+                "Custom-transport collected %d chunks, %d bytes raw SSE",
+                len(raw_chunks), len(raw_bytes),
+            )
+
+            from kitty.providers.openai_subscription import OpenAISubscriptionAdapter
+
+            cc_response = OpenAISubscriptionAdapter._parse_sse_to_response(raw_bytes)
+            logger.debug(
+                "Parsed CC response: %s",
+                json.dumps(cc_response, ensure_ascii=False)[:2000],
+            )
+            result = translator.translate_response(cc_response)
+            logger.debug(
+                "Translated Messages API result: %s",
+                json.dumps(result, ensure_ascii=False)[:2000],
+            )
+
+            msg_id = result.get("id", message_id)
+            model = result.get("model", "")
+            usage = result.get("usage", {})
+
+            # Emit Messages API SSE events
+            await sr.write(
+                format_message_start_event(
+                    {
+                        "id": msg_id,
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [],
+                        "model": model,
+                        "stop_reason": None,
+                        "stop_sequence": None,
+                        "usage": usage,
+                    }
+                ).encode()
+            )
+
+            for idx, block in enumerate(result.get("content", [])):
+                btype = block.get("type")
+                if btype == "thinking":
+                    await sr.write(
+                        format_content_block_start_event(
+                            idx, {"type": "thinking", "thinking": ""}
+                        ).encode()
+                    )
+                    await sr.write(
+                        format_content_block_delta_event(
+                            idx, {"type": "thinking_delta", "thinking": block.get("thinking", "")}
+                        ).encode()
+                    )
+                    await sr.write(format_content_block_stop_event(idx).encode())
+                elif btype == "text":
+                    await sr.write(
+                        format_content_block_start_event(
+                            idx, {"type": "text", "text": ""}
+                        ).encode()
+                    )
+                    await sr.write(
+                        format_content_block_delta_event(
+                            idx, {"type": "text_delta", "text": block.get("text", "")}
+                        ).encode()
+                    )
+                    await sr.write(format_content_block_stop_event(idx).encode())
+                elif btype == "tool_use":
+                    partial = json.dumps(block.get("input", {}), ensure_ascii=False)
+                    await sr.write(
+                        format_content_block_start_event(
+                            idx,
+                            {
+                                "type": "tool_use",
+                                "id": block.get("id", ""),
+                                "name": block.get("name", ""),
+                                "input": {},
+                            },
+                        ).encode()
+                    )
+                    await sr.write(
+                        format_content_block_delta_event(
+                            idx, {"type": "input_json_delta", "partial_json": partial}
+                        ).encode()
+                    )
+                    await sr.write(format_content_block_stop_event(idx).encode())
+
+            stop_reason = result.get("stop_reason", "end_turn")
+            await sr.write(
+                format_message_delta_event(
+                    {"stop_reason": stop_reason, "stop_sequence": None}, {}
+                ).encode()
+            )
+            await sr.write(format_message_stop_event().encode())
+            self._log_usage(cc_response.get("usage"))
+
+            try:
+                await sr.write_eof()
+            except (ConnectionResetError, BrokenPipeError, OSError):
+                logger.debug("Client disconnected before stream EOF")
+            return sr
+
         try:
             session = await self._get_session()
             url = self._build_upstream_url()
@@ -1434,6 +1585,22 @@ class BridgeServer:
         await sr.prepare(request)
 
         last_usage: dict | None = None
+
+        # Custom-transport providers handle their own HTTP requests.
+        if self._active_provider.use_custom_transport:
+            cc_request["_resolved_key"] = self._active_key
+            cc_request["_provider_config"] = self._active_provider_config
+            try:
+                await self._active_provider.stream_request(cc_request, sr.write)
+            except Exception:
+                raise
+            finally:
+                try:
+                    await sr.write_eof()
+                except (ConnectionResetError, BrokenPipeError, OSError):
+                    logger.debug("Client disconnected before stream EOF")
+            return sr
+
         try:
             session = await self._get_session()
             url = self._build_upstream_url()
@@ -1811,6 +1978,79 @@ class BridgeServer:
 
         upstream_status = None
         last_usage: dict | None = None
+
+        # Custom-transport providers return Responses API SSE but CC clients
+        # expect Chat Completions SSE.  Collect, parse, and re-emit.
+        if self._active_provider.use_custom_transport:
+            cc_request["_resolved_key"] = self._active_key
+            cc_request["_provider_config"] = self._active_provider_config
+
+            raw_chunks: list[bytes] = []
+
+            async def _collect(chunk: bytes) -> None:
+                raw_chunks.append(chunk)
+
+            try:
+                await self._active_provider.stream_request(cc_request, _collect)
+            except Exception:
+                upstream_status = 500
+                raise
+
+            raw_bytes = b"".join(raw_chunks)
+            from kitty.providers.openai_subscription import OpenAISubscriptionAdapter
+
+            cc_response = OpenAISubscriptionAdapter._parse_sse_to_response(raw_bytes)
+
+            # Re-emit as Chat Completions SSE stream
+            choice = (cc_response.get("choices") or [{}])[0]
+            msg = choice.get("message", {})
+            finish_reason = choice.get("finish_reason", "stop")
+
+            # First chunk: role + content/tool_calls start
+            first_delta: dict = {"role": "assistant", "content": None}
+            if msg.get("content"):
+                first_delta["content"] = ""
+            if msg.get("tool_calls"):
+                first_delta["tool_calls"] = [
+                    {
+                        "index": i,
+                        "id": tc.get("id", f"call_{i}"),
+                        "type": "function",
+                        "function": {"name": tc["function"]["name"], "arguments": ""},
+                    }
+                    for i, tc in enumerate(msg["tool_calls"])
+                ]
+            await sr.write(
+                f"data: {json.dumps({'id': cc_response.get('id', 'chatcmpl-sub'), 'object': 'chat.completion.chunk', 'created': cc_response.get('created', 0), 'model': cc_response.get('model', ''), 'choices': [{'index': 0, 'delta': first_delta, 'finish_reason': None}]})}\n\n".encode()
+            )
+
+            # Content delta
+            if msg.get("content"):
+                await sr.write(
+                    f"data: {json.dumps({'id': cc_response.get('id', 'chatcmpl-sub'), 'object': 'chat.completion.chunk', 'created': cc_response.get('created', 0), 'model': cc_response.get('model', ''), 'choices': [{'index': 0, 'delta': {'content': msg['content']}, 'finish_reason': None}]})}\n\n".encode()
+                )
+
+            # Tool call argument deltas
+            for i, tc in enumerate(msg.get("tool_calls", [])):
+                args = tc.get("function", {}).get("arguments", "")
+                if args:
+                    await sr.write(
+                        f"data: {json.dumps({'id': cc_response.get('id', 'chatcmpl-sub'), 'object': 'chat.completion.chunk', 'created': cc_response.get('created', 0), 'model': cc_response.get('model', ''), 'choices': [{'index': 0, 'delta': {'tool_calls': [{'index': i, 'function': {'arguments': args}}]}, 'finish_reason': None}]})}\n\n".encode()
+                    )
+
+            # Finish
+            await sr.write(
+                f"data: {json.dumps({'id': cc_response.get('id', 'chatcmpl-sub'), 'object': 'chat.completion.chunk', 'created': cc_response.get('created', 0), 'model': cc_response.get('model', ''), 'choices': [{'index': 0, 'delta': {}, 'finish_reason': finish_reason}], 'usage': cc_response.get('usage')})}\n\n".encode()
+            )
+            await sr.write(b"data: [DONE]\n\n")
+            self._log_usage(cc_response.get("usage"))
+
+            try:
+                await sr.write_eof()
+            except (ConnectionResetError, BrokenPipeError, OSError):
+                logger.debug("Client disconnected before stream EOF")
+            return sr
+
         try:
             session = await self._get_session()
             url = self._build_upstream_url()

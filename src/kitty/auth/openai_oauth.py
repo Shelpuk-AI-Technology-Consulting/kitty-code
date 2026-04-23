@@ -16,12 +16,16 @@ The full flow:
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
+import logging
 import secrets
 import urllib.parse
 import webbrowser
 from typing import TYPE_CHECKING
 
 import aiohttp
+from aiohttp import web
 
 from kitty.auth.oauth_session import (
     ID_TOKEN_TYPE,
@@ -32,6 +36,8 @@ from kitty.auth.pkce import generate_code_challenge, generate_code_verifier
 
 if TYPE_CHECKING:
     from asyncio import Future
+
+logger = logging.getLogger(__name__)
 
 # ── OpenAI OAuth endpoints ───────────────────────────────────────────────
 OAUTH_AUTH_URL = "https://auth.openai.com/oauth/authorize"
@@ -67,6 +73,17 @@ class OAuthTimeoutError(Exception):
     pass
 
 
+class OAuthTokenExchangeError(Exception):
+    """Raised when the id_token → API key exchange fails."""
+
+    def __init__(self, error: str, error_description: str | None = None) -> None:
+        self.error = error
+        self.error_description = error_description or ""
+        super().__init__(
+            f"{error}: {error_description}" if error_description else error
+        )
+
+
 class OAuthAuthorizationError(Exception):
     """Raised when the authorization server returns an error."""
 
@@ -79,6 +96,28 @@ class OAuthAuthorizationError(Exception):
 
 
 # ── URL builder ──────────────────────────────────────────────────────────
+def _decode_jwt_payload(token: str) -> dict:
+    """Decode the payload of a JWT without verifying the signature.
+
+    JWTs are base64url-encoded JSON. We only need the claims, not
+    signature verification (the token was received directly from the
+    OAuth server over TLS).
+    """
+    parts = token.split(".")
+    if len(parts) != 3:
+        return {}
+    payload = parts[1]
+    # Fix padding
+    padding = 4 - len(payload) % 4
+    if padding != 4:
+        payload += "=" * padding
+    try:
+        decoded = base64.urlsafe_b64decode(payload)
+        return json.loads(decoded)
+    except Exception:
+        return {}
+
+
 def build_auth_url(code_verifier: str, state: str | None = None) -> str:
     """Build the OpenAI authorization URL with PKCE parameters.
 
@@ -114,7 +153,7 @@ async def _start_callback_server(
     code_future: "Future[str | OAuthAuthorizationError]",
     host: str,
     port: int,
-) -> aiohttp.web.Application:
+) -> web.Application:
     """Create an aiohttp web application that handles the OAuth callback.
 
     Routes:
@@ -132,18 +171,18 @@ async def _start_callback_server(
         port: Port to bind to.
 
     Returns:
-        A configured aiohttp.web.Application.
+        A configured web.Application.
     """
-    app = aiohttp.web.Application()
+    app = web.Application()
 
-    async def handle_index(request: aiohttp.web.Request) -> aiohttp.web.Response:
-        return aiohttp.web.Response(
+    async def handle_index(request: web.Request) -> web.Response:
+        return web.Response(
             text="<html><body><p>Waiting for OpenAI authorization...</p>"
             "<p>You can close this tab.</p></body></html>",
             content_type="text/html",
         )
 
-    async def handle_callback(request: aiohttp.web.Request) -> aiohttp.web.Response:
+    async def handle_callback(request: web.Request) -> web.Response:
         received_state = request.query.get("state", "")
         if received_state != state:
             code_future.set_result(
@@ -152,7 +191,7 @@ async def _start_callback_server(
                     f"State mismatch: expected {state!r}, got {received_state!r}",
                 )
             )
-            return aiohttp.web.Response(
+            return web.Response(
                 status=400,
                 text="<html><body><p>State mismatch. Please try again.</p></body></html>",
                 content_type="text/html",
@@ -164,7 +203,7 @@ async def _start_callback_server(
             error_description = request.query.get("error_description", "")
             oauth_error = OAuthAuthorizationError(error, error_description)
             code_future.set_result(oauth_error)
-            return aiohttp.web.Response(
+            return web.Response(
                 status=400,
                 text=f"<html><body><p>Authorization error: {error}</p>"
                 f"<p>{error_description}</p></body></html>",
@@ -173,7 +212,7 @@ async def _start_callback_server(
 
         code = request.query.get("code", "")
         code_future.set_result(code)
-        return aiohttp.web.Response(
+        return web.Response(
             status=200,
             text="<html><body><p>Authorization successful!</p>"
             "<p>You can close this tab and return to the terminal.</p></body></html>",
@@ -212,12 +251,22 @@ async def _exchange_code_for_tokens(
         "code_verifier": code_verifier,
     }
     async with http.post(OAUTH_TOKEN_URL, data=payload) as resp:
-        resp.raise_for_status()
-        return await resp.json()
+        if resp.status >= 400:
+            body_text = await resp.text()
+            raise OAuthAuthorizationError(
+                f"Token exchange failed (HTTP {resp.status}): {body_text}",
+            )
+        try:
+            return await resp.json()
+        except Exception as exc:
+            raise OAuthAuthorizationError(
+                f"Malformed token response: {exc}",
+            ) from exc
 
 
 async def _exchange_id_token_for_api_key(
     id_token: str,
+    access_token: str,
     client_id: str,
     http: aiohttp.ClientSession,
 ) -> str:
@@ -225,12 +274,17 @@ async def _exchange_id_token_for_api_key(
 
     Args:
         id_token: The OpenID Connect id_token.
+        access_token: The OAuth access_token (used as Bearer auth).
         client_id: The OAuth client ID.
         http: An aiohttp ClientSession for making the request.
 
     Returns:
         The exchanged OpenAI API key string.
     """
+    # Token exchange: request an API key using the id_token as the subject.
+    # The access_token is required as Bearer auth (not a form parameter).
+    # Note: organization_id is NOT a parameter for this endpoint.
+    # The org info is embedded in the id_token JWT itself.
     payload = {
         "grant_type": TOKEN_EXCHANGE_GRANT,
         "requested_token": "openai-api-key",
@@ -238,10 +292,30 @@ async def _exchange_id_token_for_api_key(
         "subject_token_type": ID_TOKEN_TYPE,
         "client_id": client_id,
     }
-    async with http.post(OAUTH_TOKEN_URL, data=payload) as resp:
-        resp.raise_for_status()
-        result = await resp.json()
-    return result["openai_api_key"]
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+    }
+    async with http.post(OAUTH_TOKEN_URL, data=payload, headers=headers) as resp:
+        if resp.status >= 400:
+            body_text = await resp.text()
+            raise OAuthTokenExchangeError(
+                f"token_exchange_failed",
+                f"API key exchange failed (HTTP {resp.status}): {body_text}",
+            )
+        try:
+            result = await resp.json()
+        except Exception as exc:
+            raise OAuthTokenExchangeError(
+                "token_exchange_failed",
+                f"Malformed response from token exchange: {exc}",
+            ) from exc
+        api_key = result.get("openai_api_key")
+        if not api_key:
+            raise OAuthTokenExchangeError(
+                "token_exchange_failed",
+                f"Response missing openai_api_key: {result}",
+            )
+    return api_key
 
 
 # ── Main orchestrator ────────────────────────────────────────────────────
@@ -283,14 +357,14 @@ async def run_oauth_flow(http: aiohttp.ClientSession | None = None) -> OAuthSess
     code_future: "Future[str | OAuthAuthorizationError]" = loop.create_future()
 
     # Start callback server (try ports 1455-1459)
-    runner: aiohttp.web.AppRunner | None = None
+    runner: web.AppRunner | None = None
     bound_port: int | None = None
     for port in range(_CALLBACK_PORT_START, _CALLBACK_PORT_END + 1):
         try:
             app = await _start_callback_server(state, code_future, "127.0.0.1", port)
-            runner = aiohttp.web.AppRunner(app)
+            runner = web.AppRunner(app)
             await runner.setup()
-            site = aiohttp.web.TCPSite(runner, "127.0.0.1", port)
+            site = web.TCPSite(runner, "127.0.0.1", port)
             await site.start()
             bound_port = port
             break
@@ -307,8 +381,20 @@ async def run_oauth_flow(http: aiohttp.ClientSession | None = None) -> OAuthSess
         )
 
     try:
-        # Open browser
-        webbrowser.open(auth_url)
+        # Always print the URL as a fallback for WSL / headless environments
+        # where webbrowser.open may appear to succeed but nothing opens.
+        import sys
+
+        print(
+            f"\n  Opening browser for OpenAI authentication.\n"
+            f"  If the browser did not open, visit:\n\n"
+            f"    {auth_url}\n",
+            file=sys.stderr,
+        )
+        try:
+            webbrowser.open(auth_url)
+        except Exception:
+            pass
 
         # Wait for callback with timeout
         try:
@@ -336,10 +422,22 @@ async def run_oauth_flow(http: aiohttp.ClientSession | None = None) -> OAuthSess
     try:
         tokens = await _exchange_code_for_tokens(code, code_verifier, CLIENT_ID, http)
         id_token = tokens["id_token"]
+        access_token = tokens["access_token"]
 
-        # Exchange id_token for API key
-        api_key = await _exchange_id_token_for_api_key(id_token, CLIENT_ID, http)
-        tokens["api_key"] = api_key
+        # Exchange id_token for API key (best-effort).
+        # Fails for org accounts without Platform API org mapping —
+        # in that case we use the access_token directly as Bearer auth.
+        try:
+            api_key = await _exchange_id_token_for_api_key(
+                id_token, access_token, CLIENT_ID, http
+            )
+            tokens["api_key"] = api_key
+        except OAuthTokenExchangeError as exc:
+            logger.warning(
+                "API key exchange skipped (%s). "
+                "Using access_token directly for ChatGPT subscription.",
+                exc.error,
+            )
     finally:
         if close_http:
             await http.close()
