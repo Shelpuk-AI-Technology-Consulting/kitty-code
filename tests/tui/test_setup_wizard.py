@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import uuid
 from contextlib import contextmanager
-from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -206,7 +205,9 @@ def _mock_run_oauth_for_provider(session: OAuthSession):
 
 
 class TestSetupWizardOAuth:
-    def test_oauth_provider_launches_browser_not_key_prompt(self, store: ProfileStore, cred_store: CredentialStore) -> None:
+    def test_oauth_provider_launches_browser_not_key_prompt(
+        self, store: ProfileStore, cred_store: CredentialStore,
+    ) -> None:
         """When openai_subscription is selected, OAuth flow runs instead of API key prompt."""
         session = _make_oauth_session()
 

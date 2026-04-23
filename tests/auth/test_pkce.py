@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import hashlib
 import base64
+import hashlib
 
 from kitty.auth.pkce import generate_code_challenge, generate_code_verifier
 

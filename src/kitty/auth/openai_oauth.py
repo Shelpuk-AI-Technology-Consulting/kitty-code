@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import json
 import logging
 import secrets
@@ -29,8 +30,8 @@ from aiohttp import web
 
 from kitty.auth.oauth_session import (
     ID_TOKEN_TYPE,
-    OAuthSession,
     TOKEN_EXCHANGE_GRANT,
+    OAuthSession,
 )
 from kitty.auth.pkce import generate_code_challenge, generate_code_verifier
 
@@ -150,7 +151,7 @@ def build_auth_url(code_verifier: str, state: str | None = None) -> str:
 # ── Callback server ──────────────────────────────────────────────────────
 async def _start_callback_server(
     state: str,
-    code_future: "Future[str | OAuthAuthorizationError]",
+    code_future: Future[str | OAuthAuthorizationError],
     host: str,
     port: int,
 ) -> web.Application:
@@ -299,7 +300,7 @@ async def _exchange_id_token_for_api_key(
         if resp.status >= 400:
             body_text = await resp.text()
             raise OAuthTokenExchangeError(
-                f"token_exchange_failed",
+                "token_exchange_failed",
                 f"API key exchange failed (HTTP {resp.status}): {body_text}",
             )
         try:
@@ -354,7 +355,7 @@ async def run_oauth_flow(http: aiohttp.ClientSession | None = None) -> OAuthSess
 
     # Prepare the Future that the callback server will resolve
     loop = asyncio.get_running_loop()
-    code_future: "Future[str | OAuthAuthorizationError]" = loop.create_future()
+    code_future: Future[str | OAuthAuthorizationError] = loop.create_future()
 
     # Start callback server (try ports 1455-1459)
     runner: web.AppRunner | None = None
@@ -391,20 +392,18 @@ async def run_oauth_flow(http: aiohttp.ClientSession | None = None) -> OAuthSess
             f"    {auth_url}\n",
             file=sys.stderr,
         )
-        try:
+        with contextlib.suppress(Exception):
             webbrowser.open(auth_url)
-        except Exception:
-            pass
 
         # Wait for callback with timeout
         try:
             result = await asyncio.wait_for(
                 code_future, timeout=OAUTH_TIMEOUT_SECONDS
             )
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as exc:
             raise OAuthTimeoutError(
                 f"No OAuth callback received within {OAUTH_TIMEOUT_SECONDS} seconds"
-            )
+            ) from exc
 
         # Handle OAuth errors returned via the callback
         if isinstance(result, OAuthAuthorizationError):

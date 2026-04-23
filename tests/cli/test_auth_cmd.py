@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
-import json
 
 import pytest
 

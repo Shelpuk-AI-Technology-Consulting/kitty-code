@@ -12,7 +12,7 @@ from kitty.credentials.store import CredentialStore
 from kitty.profiles.schema import Profile
 from kitty.profiles.store import ProfileStore
 from kitty.tui.display import print_error, print_section, print_status, print_warning
-from kitty.tui.prompts import NonTTYError, check_tty, prompt_confirm, prompt_text
+from kitty.tui.prompts import check_tty, prompt_confirm, prompt_text
 
 if TYPE_CHECKING:
     pass
@@ -83,17 +83,11 @@ async def run_auth_openai(profile_store: ProfileStore, cred_store: CredentialSto
 
     # Step 2: Prompt for model name
     model = prompt_text("Model name (default: gpt-5.3-codex): ")
-    if not model or not model.strip():
-        model = "gpt-5.3-codex"
-    else:
-        model = model.strip()
+    model = "gpt-5.3-codex" if not model or not model.strip() else model.strip()
 
     # Step 3: Prompt for profile name
     profile_name = prompt_text("Profile name (default: openai-sub): ")
-    if not profile_name or not profile_name.strip():
-        profile_name = "openai-sub"
-    else:
-        profile_name = profile_name.strip().lower()
+    profile_name = "openai-sub" if not profile_name or not profile_name.strip() else profile_name.strip().lower()
 
     # Step 4: Ask if should be set as default
     is_default = prompt_confirm("Set as default profile?", default=True)

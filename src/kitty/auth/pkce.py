@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-import hashlib
 import base64
+import hashlib
 import secrets
-
 
 # RFC 3986 unreserved characters
 _UNRESERVED = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"

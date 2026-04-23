@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-import re
 import urllib.parse
+from contextlib import suppress
 from typing import Any
 from unittest.mock import patch
 
@@ -16,30 +16,25 @@ from aioresponses import aioresponses
 from kitty.auth.oauth_session import (
     ID_TOKEN_TYPE,
     OAUTH_TOKEN_URL,
-    OAuthSession,
     TOKEN_EXCHANGE_GRANT,
+    OAuthSession,
 )
-
+from kitty.auth.openai_oauth import (
+    OAuthAuthorizationError,
+    OAuthPortConflictError,
+    OAuthTimeoutError,
+    _exchange_code_for_tokens,
+    _exchange_id_token_for_api_key,
+    _start_callback_server,
+    build_auth_url,
+    run_oauth_flow,
+)
 
 # ── Constants (mirrored from openai_oauth.py) ──────────────────────────────
 OAUTH_AUTH_URL = "https://auth.openai.com/oauth/authorize"
 REDIRECT_URI = "http://localhost:1455/auth/callback"
 CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 SCOPE = "openid profile email offline_access"
-
-
-# ── Imports of module under test ─────────────────────────────────────────
-from kitty.auth.openai_oauth import (
-    OAuthAuthorizationError,
-    OAuthPortConflictError,
-    OAuthTimeoutError,
-    build_auth_url,
-    run_oauth_flow,
-    _exchange_code_for_tokens,
-    _exchange_id_token_for_api_key,
-    _start_callback_server,
-)
-
 
 # ── Fixtures ─────────────────────────────────────────────────────────────
 
@@ -192,11 +187,8 @@ class TestPortConflict:
 
         openai_oauth._start_callback_server = tracking_start
         try:
-            with patch("kitty.auth.openai_oauth.webbrowser.open"):
-                try:
-                    await run_oauth_flow()
-                except OAuthPortConflictError:
-                    pass  # Expected after all ports fail
+            with patch("kitty.auth.openai_oauth.webbrowser.open"), suppress(OAuthPortConflictError):
+                await run_oauth_flow()
 
             assert attempts[0] == 1455, "Should try primary port first"
             assert 1456 in attempts, "Should try first alternate port"
@@ -257,11 +249,12 @@ class TestTimeout:
 
         openai_oauth._start_callback_server = noop_start
         try:
-            with patch("kitty.auth.openai_oauth.webbrowser.open"):
-                # Use a very short timeout for the test
-                with patch("kitty.auth.openai_oauth.OAUTH_TIMEOUT_SECONDS", 1):
-                    with pytest.raises(OAuthTimeoutError):
-                        await run_oauth_flow()
+            with (
+                patch("kitty.auth.openai_oauth.webbrowser.open"),
+                patch("kitty.auth.openai_oauth.OAUTH_TIMEOUT_SECONDS", 1),
+                pytest.raises(OAuthTimeoutError),
+            ):
+                await run_oauth_flow()
         finally:
             openai_oauth._start_callback_server = original_start
 
@@ -372,27 +365,26 @@ class TestRunOAuthFlow:
 
         openai_oauth._start_callback_server = resolving_start
         try:
-            with patch("kitty.auth.openai_oauth.webbrowser.open"):
-                with aioresponses() as m:
-                    # First POST: authorization_code grant → tokens
-                    m.post(
-                        OAUTH_TOKEN_URL,
-                        payload={
-                            "access_token": "at_full_flow",
-                            "refresh_token": "rt_full_flow",
-                            "id_token": "id_full_flow",
-                            "api_key": "sk_from_code_exchange",
-                            "expires_in": 3600,
-                        },
-                    )
-                    # Second POST: token-exchange grant → API key
-                    m.post(
-                        OAUTH_TOKEN_URL,
-                        payload={"openai_api_key": "sk-exchanged-full"},
-                    )
+            with patch("kitty.auth.openai_oauth.webbrowser.open"), aioresponses() as m:
+                # First POST: authorization_code grant → tokens
+                m.post(
+                    OAUTH_TOKEN_URL,
+                    payload={
+                        "access_token": "at_full_flow",
+                        "refresh_token": "rt_full_flow",
+                        "id_token": "id_full_flow",
+                        "api_key": "sk_from_code_exchange",
+                        "expires_in": 3600,
+                    },
+                )
+                # Second POST: token-exchange grant → API key
+                m.post(
+                    OAUTH_TOKEN_URL,
+                    payload={"openai_api_key": "sk-exchanged-full"},
+                )
 
-                    async with aiohttp.ClientSession() as http:
-                        result = await run_oauth_flow(http=http)
+                async with aiohttp.ClientSession() as http:
+                    result = await run_oauth_flow(http=http)
 
             assert isinstance(result, OAuthSession)
             assert result.client_id == CLIENT_ID

@@ -16,16 +16,17 @@ kitty.auth.oauth_session.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Awaitable, Callable
 
 import aiohttp
 
-from kitty.auth.oauth_session import OAuthSession, OAuthRefreshFailed
+from kitty.auth.oauth_session import OAuthRefreshFailed, OAuthSession
 from kitty.providers.base import ProviderError
 
 # Avoid circular import — only need the parent class methods
@@ -223,7 +224,7 @@ class OpenAISubscriptionAdapter(OpenAIAdapter):
                 raise ProviderError(
                     f"Authentication refresh failed. "
                     f"Please re-authenticate with 'kitty auth openai'. Details: {exc}"
-                )
+                ) from exc
 
             original_body = cc_request.get("_original_body")
             if original_body:
@@ -275,7 +276,7 @@ class OpenAISubscriptionAdapter(OpenAIAdapter):
                 raise ProviderError(
                     f"Authentication refresh failed. "
                     f"Please re-authenticate with 'kitty auth openai'. Details: {exc}"
-                )
+                ) from exc
 
             original_body = cc_request.get("_original_body")
             if original_body:
@@ -303,10 +304,8 @@ class OpenAISubscriptionAdapter(OpenAIAdapter):
                 if resp.status >= 400:
                     raw = await resp.text()
                     body = {}
-                    try:
+                    with contextlib.suppress(Exception):
                         body = json.loads(raw)
-                    except Exception:
-                        pass
                     # Log raw response at DEBUG level for diagnosis (may contain
                     # sensitive tokens/PII — don't leak to client).
                     logger.debug("Codex backend error %d: %s", resp.status, raw[:500])
@@ -590,10 +589,7 @@ class OpenAISubscriptionAdapter(OpenAIAdapter):
 
     def map_error(self, status_code: int, body: dict) -> Exception:
         error_obj = body.get("error", body)
-        if isinstance(error_obj, dict):
-            msg = error_obj.get("message", str(error_obj))
-        else:
-            msg = str(error_obj)
+        msg = error_obj.get("message", str(error_obj)) if isinstance(error_obj, dict) else str(error_obj)
         if status_code == 401:
             return ProviderError(
                 f"OpenAI subscription auth failed. "

@@ -21,10 +21,12 @@ from kitty.bridge.messages.events import (
     format_content_block_delta_event,
     format_content_block_start_event,
     format_content_block_stop_event,
-    format_error_event as messages_format_error,
     format_message_delta_event,
     format_message_start_event,
     format_message_stop_event,
+)
+from kitty.bridge.messages.events import (
+    format_error_event as messages_format_error,
 )
 from kitty.bridge.messages.translator import MessagesTranslator
 from kitty.bridge.responses.events import (
@@ -2002,6 +2004,22 @@ class BridgeServer:
             cc_response = OpenAISubscriptionAdapter._parse_sse_to_response(raw_bytes)
 
             # Re-emit as Chat Completions SSE stream
+            response_id = cc_response.get("id", "chatcmpl-sub")
+            created = cc_response.get("created", 0)
+            model = cc_response.get("model", "")
+
+            def _cc_chunk(delta: dict, fin: str | None = None, usage: dict | None = None) -> bytes:
+                payload: dict = {
+                    "id": response_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [{"index": 0, "delta": delta, "finish_reason": fin}],
+                }
+                if usage is not None:
+                    payload["usage"] = usage
+                return f"data: {json.dumps(payload)}\n\n".encode()
+
             choice = (cc_response.get("choices") or [{}])[0]
             msg = choice.get("message", {})
             finish_reason = choice.get("finish_reason", "stop")
@@ -2020,27 +2038,23 @@ class BridgeServer:
                     }
                     for i, tc in enumerate(msg["tool_calls"])
                 ]
-            await sr.write(
-                f"data: {json.dumps({'id': cc_response.get('id', 'chatcmpl-sub'), 'object': 'chat.completion.chunk', 'created': cc_response.get('created', 0), 'model': cc_response.get('model', ''), 'choices': [{'index': 0, 'delta': first_delta, 'finish_reason': None}]})}\n\n".encode()
-            )
+            await sr.write(_cc_chunk(first_delta))
 
             # Content delta
             if msg.get("content"):
-                await sr.write(
-                    f"data: {json.dumps({'id': cc_response.get('id', 'chatcmpl-sub'), 'object': 'chat.completion.chunk', 'created': cc_response.get('created', 0), 'model': cc_response.get('model', ''), 'choices': [{'index': 0, 'delta': {'content': msg['content']}, 'finish_reason': None}]})}\n\n".encode()
-                )
+                await sr.write(_cc_chunk({"content": msg["content"]}))
 
             # Tool call argument deltas
             for i, tc in enumerate(msg.get("tool_calls", [])):
                 args = tc.get("function", {}).get("arguments", "")
                 if args:
-                    await sr.write(
-                        f"data: {json.dumps({'id': cc_response.get('id', 'chatcmpl-sub'), 'object': 'chat.completion.chunk', 'created': cc_response.get('created', 0), 'model': cc_response.get('model', ''), 'choices': [{'index': 0, 'delta': {'tool_calls': [{'index': i, 'function': {'arguments': args}}]}, 'finish_reason': None}]})}\n\n".encode()
-                    )
+                    await sr.write(_cc_chunk(
+                        {"tool_calls": [{"index": i, "function": {"arguments": args}}]},
+                    ))
 
             # Finish
             await sr.write(
-                f"data: {json.dumps({'id': cc_response.get('id', 'chatcmpl-sub'), 'object': 'chat.completion.chunk', 'created': cc_response.get('created', 0), 'model': cc_response.get('model', ''), 'choices': [{'index': 0, 'delta': {}, 'finish_reason': finish_reason}], 'usage': cc_response.get('usage')})}\n\n".encode()
+                _cc_chunk({}, fin=finish_reason, usage=cc_response.get("usage")),
             )
             await sr.write(b"data: [DONE]\n\n")
             self._log_usage(cc_response.get("usage"))

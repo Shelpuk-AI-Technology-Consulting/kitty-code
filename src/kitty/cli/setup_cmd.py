@@ -94,10 +94,7 @@ def run_setup_wizard(store: ProfileStore, cred_store: CredentialStore) -> Profil
     default_model = _default_models.get(provider)
     if default_model:
         model = prompt_text(f"Model (default: {default_model}): ")
-        if not model or not model.strip():
-            model = default_model
-        else:
-            model = model.strip()
+        model = default_model if not model or not model.strip() else model.strip()
     else:
         model = prompt_text("Model (OpenRouter or provider format, e.g. z-ai/glm-5): ")
         if not model or not model.strip():

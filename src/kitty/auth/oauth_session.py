@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import time
@@ -77,7 +78,7 @@ class OAuthSession:
     # ── Factory from token endpoint response ─────────────────────────────────
 
     @classmethod
-    def from_token_response(cls, payload: dict, client_id: str) -> "OAuthSession":
+    def from_token_response(cls, payload: dict, client_id: str) -> OAuthSession:
         """Build a session from an OAuth token endpoint response.
 
         Args:
@@ -115,7 +116,7 @@ class OAuthSession:
         }
 
     @classmethod
-    def from_dict(cls, data: dict) -> "OAuthSession":
+    def from_dict(cls, data: dict) -> OAuthSession:
         """Reconstruct from a JSON dict (no _file_path)."""
         return cls(
             client_id=data["client_id"],
@@ -131,7 +132,7 @@ class OAuthSession:
     # ── File persistence ───────────────────────────────────────────────────
 
     @classmethod
-    def load(cls, path: Path) -> "OAuthSession":
+    def load(cls, path: Path) -> OAuthSession:
         """Load a session from a JSON file."""
         data = json.loads(path.read_text(encoding="utf-8"))
         session = cls.from_dict(data)
@@ -153,8 +154,8 @@ class OAuthSession:
 
     @classmethod
     def create_session_file(
-        cls, session: "OAuthSession", auth_ref: str, config_dir: Path
-    ) -> "OAuthSession":
+        cls, session: OAuthSession, auth_ref: str, config_dir: Path
+    ) -> OAuthSession:
         """Set _file_path and persist the session.
 
         Args:
@@ -213,10 +214,8 @@ class OAuthSession:
         async with http.post(OAUTH_TOKEN_URL, data=refresh_payload, timeout=_OAUTH_TIMEOUT) as resp:
             if resp.status >= 400:
                 body = {}
-                try:
+                with contextlib.suppress(Exception):
                     body = await resp.json()
-                except Exception:
-                    pass
                 raise OAuthRefreshFailed(
                     body.get("error", f"HTTP {resp.status}"),
                     body.get("error_description"),
@@ -270,10 +269,8 @@ class OAuthSession:
         async with http.post(OAUTH_TOKEN_URL, data=payload, timeout=_OAUTH_TIMEOUT) as resp:
             if resp.status >= 400:
                 body = {}
-                try:
+                with contextlib.suppress(Exception):
                     body = await resp.json()
-                except Exception:
-                    pass
                 raise OAuthTokenExchangeFailed(
                     body.get("error", "token_exchange_failed"),
                     body.get("error_description"),
@@ -305,7 +302,12 @@ class OAuthSession:
         """
         async with self._refresh_lock:
             # Re-check after acquiring the lock — another coroutine may have refreshed
-            if not force_refresh and not self.access_token_expired and not self.api_key_expired and not self._should_proactive_refresh:
+            if (
+                not force_refresh
+                and not self.access_token_expired
+                and not self.api_key_expired
+                and not self._should_proactive_refresh
+            ):
                 return self.api_key or self.access_token
 
             try:

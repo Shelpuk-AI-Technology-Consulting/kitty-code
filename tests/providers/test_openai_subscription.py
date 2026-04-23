@@ -5,16 +5,14 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from kitty.auth.oauth_session import OAuthSession
 from kitty.providers.openai_subscription import (
-    OpenAISubscriptionAdapter,
     _CODEX_BACKEND_URL,
+    OpenAISubscriptionAdapter,
 )
-
 
 # ── Fixtures ──────────────────────────────────────────────────────────────
 
