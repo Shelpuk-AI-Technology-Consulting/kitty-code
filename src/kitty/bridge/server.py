@@ -33,6 +33,7 @@ from kitty.bridge.responses.events import (
     format_error_event as responses_format_error,
 )
 from kitty.bridge.responses.translator import ResponsesTranslator
+from kitty.cloudflare import is_cloudflare_block
 from kitty.launchers.base import LauncherAdapter
 from kitty.profiles.schema import Profile
 from kitty.providers.base import ProviderAdapter
@@ -781,6 +782,17 @@ class BridgeServer:
                     if upstream.status not in (200, 201):
                         error_body = await upstream.text()
 
+                        # Cloudflare challenge — never retryable, abort immediately
+                        if self._is_cloudflare_block(upstream.status, error_body):
+                            logger.error("Upstream Cloudflare block %d: %s", upstream.status, error_body[:200])
+                            error_msg = self._translate_upstream_error(upstream.status, error_body)
+                            error_event = responses_format_error(
+                                {"code": "upstream_error", "message": error_msg},
+                                seq=translator._next_seq(),
+                            )
+                            await sr.write(error_event.encode())
+                            break
+
                         # In balancing mode: mark unhealthy, try next backend
                         if self._backends and self._current_backend_idx >= 0:
                             self._mark_backend_unhealthy(self._current_backend_idx)
@@ -1283,6 +1295,16 @@ class BridgeServer:
                         if upstream.status not in (200, 201):
                             error_body = await upstream.text()
 
+                            # Cloudflare challenge — never retryable, abort immediately
+                            if self._is_cloudflare_block(upstream.status, error_body):
+                                logger.error("Upstream Cloudflare block %d: %s", upstream.status, error_body[:200])
+                                error_msg = self._translate_upstream_error(upstream.status, error_body)
+                                error_event = messages_format_error(
+                                    {"type": "error", "error": {"type": "api_error", "message": error_msg}},
+                                )
+                                await sr.write(error_event.encode())
+                                break
+
                             retryable = self._should_retry_stream(upstream.status, error_body)
                             # In balancing mode: mark unhealthy and try next backend for ANY error
                             if self._backends and self._current_backend_idx >= 0:
@@ -1711,6 +1733,19 @@ class BridgeServer:
                     if upstream.status not in (200, 201):
                         error_body = await upstream.text()
                         logger.error("Upstream error %d: %s", upstream.status, error_body)
+
+                        # Cloudflare challenge — never retryable, abort immediately
+                        if self._is_cloudflare_block(upstream.status, error_body):
+                            logger.error("Upstream Cloudflare block %d", upstream.status)
+                            error_msg = self._translate_upstream_error(upstream.status, error_body)
+                            error_sse = (
+                                f"data: {json.dumps({'error': {'code': 'upstream_error', 'message': error_msg}})}\n\n"
+                            )
+                            try:
+                                await sr.write(error_sse.encode())
+                            except (ConnectionResetError, BrokenPipeError, OSError):
+                                logger.debug("Client disconnected before Cloudflare error event")
+                            break
 
                         # In balancing mode: mark unhealthy, try next backend
                         if self._backends and self._current_backend_idx >= 0:
@@ -2212,6 +2247,19 @@ class BridgeServer:
                         error_body = await upstream.text()
                         logger.error("Upstream error %d: %s", upstream.status, error_body)
 
+                        # Cloudflare challenge — never retryable, abort immediately
+                        if self._is_cloudflare_block(upstream.status, error_body):
+                            logger.error("Upstream Cloudflare block %d", upstream.status)
+                            error_msg = self._translate_upstream_error(upstream.status, error_body)
+                            error_sse = (
+                                f"data: {json.dumps({'error': {'message': error_msg, 'type': 'upstream_error'}})}\n\n"
+                            )
+                            try:
+                                await sr.write(error_sse.encode())
+                            except (ConnectionResetError, BrokenPipeError, OSError):
+                                logger.debug("Client disconnected before Cloudflare error event")
+                            break
+
                         # In balancing mode: mark unhealthy, try next backend
                         if self._backends and self._current_backend_idx >= 0:
                             self._mark_backend_unhealthy(self._current_backend_idx)
@@ -2634,9 +2682,13 @@ class BridgeServer:
         searchable = f"{code} {message}".lower()
         return any(p in searchable for p in _RATE_LIMIT_PATTERNS)
 
+    _is_cloudflare_block = staticmethod(is_cloudflare_block)
+
     @staticmethod
     def _should_retry_stream(status: int, error_body: str) -> bool:
         """Return True if a streaming error should trigger a retry / backend switch."""
+        if BridgeServer._is_cloudflare_block(status, error_body):
+            return False
         if status in _RETRYABLE_STATUSES:
             return True
         return BridgeServer._is_rate_limit_error(status, error_body)
@@ -2702,12 +2754,20 @@ class BridgeServer:
         else:
             details = str(body)
 
+        if status == 403 and isinstance(body, str) and BridgeServer._is_cloudflare_block(status, body):
+            return (
+                "Cloudflare bot detection blocked the upstream request. "
+                "This is not an API key problem and retries will not help. "
+                "The upstream is challenging Kitty's non-browser TLS fingerprint."
+            )
+
         if status in (401, 403):
             return (
                 f"Upstream authentication failed (HTTP {status}): "
                 "API key is invalid, expired, or lacks permission. "
                 "Update your API key with 'kitty setup'."
             )
+
 
         code, error_message = BridgeServer._extract_error_fields(body)
 

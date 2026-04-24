@@ -694,3 +694,28 @@ class TestModelOverride:
                     assert sent_json["model"] == "claude-sonnet-4-20250514"
         finally:
             await server.stop_async()
+
+
+# ── Cloudflare detection ──────────────────────────────────────────────────
+
+class TestCloudflareDetection:
+    def test_detects_cloudflare_block(self) -> None:
+        assert BridgeServer._is_cloudflare_block(403, "<html>cf-mitigated: challenge</html>") is True
+
+    def test_rejects_non_cloudflare_403(self) -> None:
+        assert BridgeServer._is_cloudflare_block(403, "<html>Forbidden</html>") is False
+
+    def test_translate_upstream_error_cloudflare(self) -> None:
+        msg = BridgeServer._translate_upstream_error(
+            403,
+            "<html>cf-browser-verification window._cf_chl_opt = {};</html>",
+        )
+        lower = msg.lower()
+        assert "cloudflare bot detection" in lower
+        assert "not an api key problem" in lower
+
+    def test_should_retry_stream_rejects_cloudflare(self) -> None:
+        assert BridgeServer._should_retry_stream(403, "<html>cf-mitigated: challenge</html>") is False
+
+    def test_should_retry_stream_keeps_retryable_errors(self) -> None:
+        assert BridgeServer._should_retry_stream(503, "service unavailable") is True

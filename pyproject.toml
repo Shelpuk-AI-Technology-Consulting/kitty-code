@@ -26,6 +26,7 @@ classifiers = [
 ]
 dependencies = [
     "aiohttp>=3.9",
+    "curl_cffi>=0.7",
     "pydantic>=2.0",
     "keyring>=23.0",
     "rich>=13.0",
@@ -85,7 +86,7 @@ warn_return_any = true
 warn_unused_configs = true
 
 [[tool.mypy.overrides]]
-module = ["aiohttp.*", "keyring.*", "filelock.*", "platformdirs.*", "rich.*", "aioresponses.*", "boto3.*", "botocore.*", "questionary.*"]
+module = ["aiohttp.*", "curl_cffi.*", "keyring.*", "filelock.*", "platformdirs.*", "rich.*", "aioresponses.*", "boto3.*", "botocore.*", "questionary.*"]
 ignore_missing_imports = true
 
 [tool.importlinter]

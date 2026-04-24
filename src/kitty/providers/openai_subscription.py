@@ -12,6 +12,12 @@ directly against the Codex backend.
 
 Token lifecycle (refresh, re-exchange) is handled by OAuthSession in
 kitty.auth.oauth_session.
+
+Transport: curl_cffi (AsyncSession) for Codex backend requests.  curl_cffi
+uses libcurl under the hood with HTTP/2 and a native TLS fingerprint that
+matches the real Codex CLI (Rust reqwest + rustls).  A long-lived session
+automatically persists Cloudflare cookies across requests.  OAuth token
+refresh uses a short-lived aiohttp session (auth.openai.com has no CF issues).
 """
 
 from __future__ import annotations
@@ -19,14 +25,16 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import platform
 import time
 import uuid
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
-import aiohttp
+import curl_cffi.requests
 
 from kitty.auth.oauth_session import OAuthRefreshFailed, OAuthSession
+from kitty.cloudflare import is_cloudflare_block
 from kitty.providers.base import ProviderError
 
 # Avoid circular import — only need the parent class methods
@@ -38,7 +46,8 @@ logger = logging.getLogger(__name__)
 
 # Codex backend endpoint for ChatGPT subscription access
 _CODEX_BACKEND_URL = "https://chatgpt.com/backend-api/codex/responses"
-_CODEX_TIMEOUT = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=300)
+# Timeout: (connect_seconds, read_seconds) — matches Codex CLI reqwest defaults
+_CODEX_TIMEOUT = (30, 300)
 
 
 def _convert_content_types(items: list) -> list:
@@ -79,9 +88,15 @@ class OpenAISubscriptionAdapter(OpenAIAdapter):
 
     Uses OAuth (Codex PKCE flow) to obtain an access_token JWT.  Routes
     requests to chatgpt.com/backend-api/codex/responses (Responses API).
+
+    Transport uses curl_cffi AsyncSession to match the real Codex CLI's
+    HTTP behavior (reqwest + rustls, HTTP/2, native TLS fingerprint).
     """
 
     provider_type = "openai_subscription"
+
+    def __init__(self) -> None:
+        self._curl_session_instance: curl_cffi.requests.AsyncSession | None = None
 
     @property
     def requires_oauth(self) -> bool:
@@ -96,6 +111,19 @@ class OpenAISubscriptionAdapter(OpenAIAdapter):
     @property
     def use_custom_transport(self) -> bool:
         return True
+
+    @property
+    def _curl_session(self) -> curl_cffi.requests.AsyncSession:
+        """Long-lived curl_cffi session for Codex backend requests.
+
+        Lazily created, never explicitly closed during normal operation.
+        Automatically persists Cloudflare cookies across requests.
+        Not using ``async with`` avoids the curl_cffi segfault (issue #675)
+        that occurs when closing a session with an active SSE stream.
+        """
+        if self._curl_session_instance is None:
+            self._curl_session_instance = curl_cffi.requests.AsyncSession()
+        return self._curl_session_instance
 
     # ── Helpers ────────────────────────────────────────────────────────────
 
@@ -116,24 +144,22 @@ class OpenAISubscriptionAdapter(OpenAIAdapter):
     def _build_codex_headers(
         self, access_token: str, id_token: str
     ) -> dict[str, str]:
-        """Build headers for the Codex backend request."""
+        """Build headers matching the Codex CLI (reqwest + rustls).
+
+        Matches the headers sent by the real Codex CLI binary:
+        - User-Agent: codex_cli_rs format (not a browser)
+        - No Origin/Referer (not a browser request)
+        - Authorization: Bearer (from OAuth)
+        - ChatGPT-Account-ID: from JWT (if present)
+
+        NOTE: Do NOT set ``originator: codex_cli_rs`` — it triggers strict
+        tool validation that only allows Codex CLI's built-in tools.
+        """
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {access_token}",
-            "Accept": "text/event-stream",
-            "OpenAI-Beta": "responses=experimental",
-            "session_id": uuid.uuid4().hex,
-            # Mimic Codex CLI browser-like headers for Cloudflare bypass
-            "User-Agent": (
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Codex-CLI/0.1.0 Chrome/136.0.0.0 "
-                "Safari/537.36"
-            ),
-            "Origin": "https://chatgpt.com",
-            "Referer": "https://chatgpt.com/",
+            "User-Agent": f"codex_cli_rs/0.0.0 ({platform.system()} {platform.machine()})",
         }
-        # NOTE: Do NOT set originator: codex_cli_rs — it triggers strict
-        # tool validation that only allows Codex CLI's built-in tools.
         account_id = self._extract_account_id(id_token)
         if account_id:
             headers["chatgpt-account-id"] = account_id
@@ -149,6 +175,16 @@ class OpenAISubscriptionAdapter(OpenAIAdapter):
         if not session_file.exists():
             raise ProviderError(f"OAuth session file not found: {session_file}")
         return OAuthSession.load(session_file)
+
+    @staticmethod
+    def _handle_curl_error(exc: Exception) -> ProviderError:
+        """Map curl_cffi transport exceptions to ProviderError."""
+        exc_msg = str(exc).lower()
+        if "timed out" in exc_msg or "timeout" in exc_msg:
+            return ProviderError(f"Codex backend request timed out: {exc}")
+        if "connection" in exc_msg:
+            return ProviderError(f"Codex backend connection failed: {exc}")
+        return ProviderError(f"Codex backend request failed: {exc}")
 
     _ALLOWED_RESPONSES_PARAMS = frozenset({
         "model", "stream", "store", "instructions", "input",
@@ -217,44 +253,64 @@ class OpenAISubscriptionAdapter(OpenAIAdapter):
         """
         session = self._load_session(cc_request)
 
-        async with aiohttp.ClientSession() as http:
+        # Use short-lived aiohttp session for OAuth token refresh only
+        # (auth.openai.com has no Cloudflare issue)
+        import aiohttp
+
+        async with aiohttp.ClientSession() as oauth_http:
             try:
-                access_token = await session.get_valid_api_key(http)
+                access_token = await session.get_valid_api_key(oauth_http)
             except OAuthRefreshFailed as exc:
                 raise ProviderError(
                     f"Authentication refresh failed. "
                     f"Please re-authenticate with 'kitty auth openai'. Details: {exc}"
                 ) from exc
 
-            original_body = cc_request.get("_original_body")
-            if original_body:
-                resp_body = self._prepare_responses_body(original_body)
-                # Inject reasoning effort from normalized metadata if not already present
-                if "reasoning" not in resp_body:
-                    effort = cc_request.get("_reasoning_effort")
-                    if effort and effort != "none":
-                        resp_body["reasoning"] = {"effort": effort}
-            else:
-                resp_body = self._cc_to_responses(cc_request)
+        original_body = cc_request.get("_original_body")
+        if original_body:
+            resp_body = self._prepare_responses_body(original_body)
+            # Inject reasoning effort from normalized metadata if not already present
+            if "reasoning" not in resp_body:
+                effort = cc_request.get("_reasoning_effort")
+                if effort and effort != "none":
+                    resp_body["reasoning"] = {"effort": effort}
+        else:
+            resp_body = self._cc_to_responses(cc_request)
 
-            # Codex backend requires streaming
-            resp_body["stream"] = True
+        # Codex backend requires streaming
+        resp_body["stream"] = True
 
-            headers = self._build_codex_headers(access_token, session.id_token)
+        headers = self._build_codex_headers(access_token, session.id_token)
 
-            async with http.post(
-                _CODEX_BACKEND_URL, json=resp_body, headers=headers,
+        try:
+            resp = await self._curl_session.post(
+                _CODEX_BACKEND_URL,
+                json=resp_body,
+                headers=headers,
                 timeout=_CODEX_TIMEOUT,
-            ) as resp:
-                if resp.status >= 400:
-                    try:
-                        body = await resp.json()
-                    except Exception:
-                        body = {}
-                    raise self.map_error(resp.status, body)
-                # Read the full streamed response
-                raw = await resp.read()
-                return self._parse_sse_to_response(raw)
+            )
+        except Exception as exc:
+            raise self._handle_curl_error(exc) from exc
+
+        try:
+            if resp.status_code >= 400:
+                raw = resp.text
+                if self._is_cloudflare_block(resp.status_code, raw):
+                    logger.warning("Codex backend blocked by Cloudflare challenge")
+                    raise self.map_error(resp.status_code, {"error": {"message": raw}})
+                body = {}
+                with contextlib.suppress(Exception):
+                    body = json.loads(raw)
+                if not body:
+                    body = {"error": {"message": raw}}
+                raise self.map_error(resp.status_code, body)
+
+            # Read the full streamed response
+            return self._parse_sse_to_response(resp.content)
+        finally:
+            # Release the connection back to the pool.
+            with contextlib.suppress(Exception):
+                resp.close()
 
     async def stream_request(
         self,
@@ -269,55 +325,75 @@ class OpenAISubscriptionAdapter(OpenAIAdapter):
         """
         session = self._load_session(cc_request)
 
-        async with aiohttp.ClientSession() as http:
+        # Use short-lived aiohttp session for OAuth token refresh only
+        import aiohttp
+
+        async with aiohttp.ClientSession() as oauth_http:
             try:
-                access_token = await session.get_valid_api_key(http)
+                access_token = await session.get_valid_api_key(oauth_http)
             except OAuthRefreshFailed as exc:
                 raise ProviderError(
                     f"Authentication refresh failed. "
                     f"Please re-authenticate with 'kitty auth openai'. Details: {exc}"
                 ) from exc
 
-            original_body = cc_request.get("_original_body")
-            if original_body:
-                resp_body = self._prepare_responses_body(original_body)
-                # Inject reasoning effort from normalized metadata if not already present
-                if "reasoning" not in resp_body:
-                    effort = cc_request.get("_reasoning_effort")
-                    if effort and effort != "none":
-                        resp_body["reasoning"] = {"effort": effort}
-            else:
-                resp_body = self._cc_to_responses(cc_request)
+        original_body = cc_request.get("_original_body")
+        if original_body:
+            resp_body = self._prepare_responses_body(original_body)
+            # Inject reasoning effort from normalized metadata if not already present
+            if "reasoning" not in resp_body:
+                effort = cc_request.get("_reasoning_effort")
+                if effort and effort != "none":
+                    resp_body["reasoning"] = {"effort": effort}
+        else:
+            resp_body = self._cc_to_responses(cc_request)
 
-            # Debug: log the full request body for diagnosis
-            logger.debug(
-                "Codex backend request: %s",
-                json.dumps(resp_body, indent=2, ensure_ascii=False)[:3000],
-            )
+        # Debug: log the full request body for diagnosis
+        logger.debug(
+            "Codex backend request: %s",
+            json.dumps(resp_body, indent=2, ensure_ascii=False)[:3000],
+        )
 
-            headers = self._build_codex_headers(access_token, session.id_token)
+        headers = self._build_codex_headers(access_token, session.id_token)
 
-            async with http.post(
-                _CODEX_BACKEND_URL, json=resp_body, headers=headers,
+        try:
+            resp = await self._curl_session.post(
+                _CODEX_BACKEND_URL,
+                json=resp_body,
+                headers=headers,
                 timeout=_CODEX_TIMEOUT,
-            ) as resp:
-                if resp.status >= 400:
-                    raw = await resp.text()
-                    body = {}
-                    with contextlib.suppress(Exception):
-                        body = json.loads(raw)
-                    # Log raw response at DEBUG level for diagnosis (may contain
-                    # sensitive tokens/PII — don't leak to client).
-                    logger.debug("Codex backend error %d: %s", resp.status, raw[:500])
-                    if not body:
-                        body = {"error": {"message": f"Codex backend returned {resp.status}"}}
-                    raise self.map_error(resp.status, body)
-                async for chunk in resp.content.iter_any():
-                    if chunk:
-                        # Strip UTF-8 BOM that some responses include
-                        cleaned = chunk.replace(b"\xef\xbb\xbf", b"")
-                        if cleaned:
-                            await write(cleaned)
+                stream=True,
+            )
+        except Exception as exc:
+            raise self._handle_curl_error(exc) from exc
+
+        try:
+            if resp.status_code >= 400:
+                raw = resp.text
+                if self._is_cloudflare_block(resp.status_code, raw):
+                    logger.warning("Codex backend blocked by Cloudflare challenge")
+                    raise self.map_error(resp.status_code, {"error": {"message": raw}})
+                body = {}
+                with contextlib.suppress(Exception):
+                    body = json.loads(raw)
+                # Log raw response at DEBUG level for diagnosis
+                logger.debug("Codex backend error %d: %s", resp.status_code, raw[:500])
+                if not body:
+                    body = {"error": {"message": raw}}
+                raise self.map_error(resp.status_code, body)
+
+            async for chunk in resp.aiter_content():
+                if chunk:
+                    # Strip UTF-8 BOM that some responses include
+                    cleaned = chunk.replace(b"\xef\xbb\xbf", b"")
+                    if cleaned:
+                        await write(cleaned)
+        finally:
+            # Release the connection back to the pool without closing the
+            # session.  Wrapped in suppress to avoid issues with already-closed
+            # or incomplete streams (curl_cffi segfault mitigation, issue #675).
+            with contextlib.suppress(Exception):
+                resp.close()
 
     def _cc_to_responses(self, cc_request: dict) -> dict:
         """Convert a CC (Chat Completions) request to Responses API format.
@@ -587,6 +663,11 @@ class OpenAISubscriptionAdapter(OpenAIAdapter):
             "usage": usage,
         }
 
+    # ── Cloudflare detection ───────────────────────────────────────────────
+
+    # Delegate to shared utility; keep thin wrapper for backward compat
+    _is_cloudflare_block = staticmethod(is_cloudflare_block)
+
     def map_error(self, status_code: int, body: dict) -> Exception:
         error_obj = body.get("error", body)
         msg = error_obj.get("message", str(error_obj)) if isinstance(error_obj, dict) else str(error_obj)
@@ -600,6 +681,12 @@ class OpenAISubscriptionAdapter(OpenAIAdapter):
                 f"OpenAI subscription rate limited: {msg}"
             )
         if status_code == 403:
+            if is_cloudflare_block(403, msg):
+                return ProviderError(
+                    "Cloudflare bot detection blocked the Codex backend request. "
+                    "This is a TLS-fingerprint issue, not an API key problem. "
+                    "Re-authenticating or retrying will not help."
+                )
             return ProviderError(
                 f"OpenAI subscription access denied: {msg}"
             )

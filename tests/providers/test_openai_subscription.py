@@ -2,17 +2,95 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import time
 from pathlib import Path
+from typing import AsyncIterator
 
 import pytest
+
+import unittest.mock
 
 from kitty.auth.oauth_session import OAuthSession
 from kitty.providers.openai_subscription import (
     _CODEX_BACKEND_URL,
     OpenAISubscriptionAdapter,
 )
+
+
+# ── Async mock helpers ────────────────────────────────────────────────────
+
+async def _async_yield(value: object) -> AsyncIterator:
+    """Yield a single value as an async context manager body."""
+    yield value
+
+
+def _make_mock_codex_response(
+    *, status_code: int, text: str = "", content: bytes | None = None,
+) -> unittest.mock.MagicMock:
+    """Create a mock curl_cffi response object.
+
+    curl_cffi response properties (status_code, text, content) are
+    synchronous — no ``await`` needed.
+    """
+    mock_resp = unittest.mock.MagicMock()
+    mock_resp.status_code = status_code
+    mock_resp.text = text
+    mock_resp.content = content if content is not None else text.encode()
+    mock_resp.close = unittest.mock.MagicMock()
+    return mock_resp
+
+
+def _make_streaming_codex_response(
+    *, status_code: int, chunks: list[bytes],
+) -> unittest.mock.MagicMock:
+    """Create a mock curl_cffi streaming response with async content iterator."""
+    mock_resp = unittest.mock.MagicMock()
+    mock_resp.status_code = status_code
+    mock_resp.text = b"".join(chunks).decode("utf-8", errors="replace")
+    mock_resp.content = b"".join(chunks)
+    mock_resp.close = unittest.mock.MagicMock()
+
+    async def _aiter_content():
+        for chunk in chunks:
+            yield chunk
+
+    mock_resp.aiter_content = _aiter_content
+    return mock_resp
+
+
+@contextlib.contextmanager
+def _mock_curl_session(mock_response: object) -> unittest.mock.MagicMock:
+    """Patch the provider's ``_curl_session`` property to return a mock.
+
+    The mock session has a ``post()`` async method that returns the given
+    mock response.  Also patches ``aiohttp.ClientSession`` so the OAuth
+    token refresh path gets a no-op session (tokens are fresh in fixtures).
+    """
+    mock_session = unittest.mock.AsyncMock()
+    mock_session.post = unittest.mock.AsyncMock(return_value=mock_response)
+    mock_session.close = unittest.mock.MagicMock()
+
+    with unittest.mock.patch.object(
+        OpenAISubscriptionAdapter,
+        "_curl_session",
+        new_callable=unittest.mock.PropertyMock,
+        return_value=mock_session,
+    ):
+        # aiohttp is imported locally inside the methods, so we must
+        # patch it at the module level.  Since test fixtures have
+        # non-expired tokens, get_valid_api_key() won't actually call
+        # the session — but we need it to be instantiable.
+        mock_aiohttp_session = unittest.mock.MagicMock()
+        mock_aiohttp_session.__aenter__ = unittest.mock.AsyncMock(return_value=mock_aiohttp_session)
+        mock_aiohttp_session.__aexit__ = unittest.mock.AsyncMock(return_value=False)
+        with unittest.mock.patch(
+            "aiohttp.ClientSession",
+            return_value=mock_aiohttp_session,
+        ):
+            yield mock_session
+
 
 # ── Fixtures ──────────────────────────────────────────────────────────────
 
@@ -225,3 +303,279 @@ class TestMapError:
     def test_map_error_401_mentions_reauth(self, adapter: OpenAISubscriptionAdapter) -> None:
         error = adapter.map_error(401, {"error": {"message": "Unauthorized", "code": "invalid_api_key"}})
         assert "re-authenticate" in str(error)
+
+    def test_map_error_403_cloudflare_html(self, adapter: OpenAISubscriptionAdapter) -> None:
+        error = adapter.map_error(
+            403, {"error": {"message": "<html><head>cf-mitigated: challenge</head></html>"}}
+        )
+        msg = str(error).lower()
+        assert "cloudflare" in msg
+        assert "not an api key problem" in msg
+
+    def test_map_error_403_non_cloudflare(self, adapter: OpenAISubscriptionAdapter) -> None:
+        error = adapter.map_error(403, {"error": {"message": "Forbidden"}})
+        msg = str(error)
+        assert "access denied" in msg
+        assert "cloudflare" not in msg.lower()
+
+
+# ── Cloudflare HTML detection ──────────────────────────────────────────────
+
+_CLOUDFLARE_HTML = """<html>
+  <head>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style global>body{font-family:Arial,Helvetica,sans-serif}</style>
+    <meta http-equiv="refresh" content="360">
+  </head>
+  <body>
+    <div class="container">
+      <div class="logo">
+        <svg xmlns="http://www.w3.org/2000/svg"></svg>
+      </div>
+      <div class="cf-browser-verification cf-im-under-attack">
+        Please wait...
+      </div>
+    </div>
+    <script>
+    window._cf_chl_opt = {};
+    </script>
+  </body>
+</html>"""
+
+_NON_CF_HTML = "<html><body><h1>Access Denied</h1><p>You do not have permission.</p></body></html>"
+
+
+class TestIsCloudflareBlock:
+    def test_detects_cf_challenge_html(self) -> None:
+        assert OpenAISubscriptionAdapter._is_cloudflare_block(403, _CLOUDFLARE_HTML) is True
+
+    def test_detects_cf_mitigated_header(self) -> None:
+        body = "cf-mitigated: challenge something something"
+        assert OpenAISubscriptionAdapter._is_cloudflare_block(403, body) is True
+
+    def test_detects_cf_chl_opt(self) -> None:
+        body = 'some text <script>window._cf_chl_opt = {};</script> more text'
+        assert OpenAISubscriptionAdapter._is_cloudflare_block(403, body) is True
+
+    def test_non_cf_html_returns_false(self) -> None:
+        assert OpenAISubscriptionAdapter._is_cloudflare_block(403, _NON_CF_HTML) is False
+
+    def test_json_error_returns_false(self) -> None:
+        body = '{"error": {"message": "Forbidden", "code": "forbidden"}}'
+        assert OpenAISubscriptionAdapter._is_cloudflare_block(403, body) is False
+
+    def test_non_403_returns_false(self) -> None:
+        assert OpenAISubscriptionAdapter._is_cloudflare_block(200, _CLOUDFLARE_HTML) is False
+
+    def test_429_with_html_returns_false(self) -> None:
+        assert OpenAISubscriptionAdapter._is_cloudflare_block(429, _CLOUDFLARE_HTML) is False
+
+
+# ── Codex CLI headers ──────────────────────────────────────────────────────
+
+class TestCodexHeaders:
+    def test_user_agent_is_codex_cli_format(self, adapter: OpenAISubscriptionAdapter) -> None:
+        headers = adapter._build_codex_headers("tok", _make_id_token())
+        ua = headers["User-Agent"]
+        assert ua.startswith("codex_cli_rs/")
+
+    def test_no_browser_headers(self, adapter: OpenAISubscriptionAdapter) -> None:
+        """Codex CLI does not send browser-like headers."""
+        headers = adapter._build_codex_headers("tok", _make_id_token())
+        assert "Origin" not in headers
+        assert "Referer" not in headers
+        assert "Accept" not in headers
+        assert "OpenAI-Beta" not in headers
+
+    def test_authorization_bearer(self, adapter: OpenAISubscriptionAdapter) -> None:
+        headers = adapter._build_codex_headers("my-token", _make_id_token())
+        assert headers["Authorization"] == "Bearer my-token"
+
+    def test_account_id_from_jwt(self, adapter: OpenAISubscriptionAdapter) -> None:
+        headers = adapter._build_codex_headers("tok", _make_id_token("acct-42"))
+        assert headers["chatgpt-account-id"] == "acct-42"
+
+    def test_no_account_id_without_jwt_claim(self, adapter: OpenAISubscriptionAdapter) -> None:
+        headers = adapter._build_codex_headers("tok", _make_id_token(None))
+        assert "chatgpt-account-id" not in headers
+
+    def test_no_originator_header(self, adapter: OpenAISubscriptionAdapter) -> None:
+        """The originator header triggers strict tool validation on the backend."""
+        headers = adapter._build_codex_headers("tok", _make_id_token())
+        assert "originator" not in headers
+
+
+# ── curl_cffi error mapping ──────────────────────────────────────────────
+
+class TestHandleCurlError:
+    def test_timeout_error(self) -> None:
+        exc = Exception("Connection timed out after 30s")
+        result = OpenAISubscriptionAdapter._handle_curl_error(exc)
+        assert "timed out" in str(result)
+
+    def test_connection_error(self) -> None:
+        exc = Exception("Connection refused: chatgpt.com")
+        result = OpenAISubscriptionAdapter._handle_curl_error(exc)
+        assert "connection failed" in str(result)
+
+    def test_generic_error(self) -> None:
+        exc = Exception("Something unexpected")
+        result = OpenAISubscriptionAdapter._handle_curl_error(exc)
+        assert "request failed" in str(result)
+
+
+# ── Session reuse ────────────────────────────────────────────────────────
+
+class TestCurlSessionReuse:
+    def test_same_instance_returned(self, adapter: OpenAISubscriptionAdapter) -> None:
+        """The lazy _curl_session property returns the same instance."""
+        s1 = adapter._curl_session
+        s2 = adapter._curl_session
+        assert s1 is s2
+
+
+# ── Cloudflare detection in request methods ──────────────────────────────
+
+class TestStreamRequestCloudflare:
+    """Test that stream_request detects Cloudflare blocks and raises specific error."""
+
+    @pytest.mark.asyncio()
+    async def test_stream_request_raises_cloudflare_error(
+        self, adapter: OpenAISubscriptionAdapter, fresh_session: tuple[OAuthSession, Path],
+    ) -> None:
+        """stream_request should raise ProviderError with Cloudflare message on CF block."""
+        _, session_path = fresh_session
+        cc_request = {
+            "model": "gpt-5.4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+            "_resolved_key": str(session_path),
+        }
+        written: list[bytes] = []
+
+        async def mock_write(data: bytes) -> None:
+            written.append(data)
+
+        from kitty.providers.base import ProviderError
+
+        mock_resp = _make_mock_codex_response(status_code=403, text=_CLOUDFLARE_HTML)
+        with _mock_curl_session(mock_resp):
+            with pytest.raises(ProviderError, match="[Cc]loudflare"):
+                await adapter.stream_request(cc_request, mock_write)
+            assert written == []
+
+
+class TestMakeRequestCloudflare:
+    """Test that make_request detects Cloudflare blocks and raises specific error."""
+
+    @pytest.mark.asyncio()
+    async def test_make_request_raises_cloudflare_error(
+        self, adapter: OpenAISubscriptionAdapter, fresh_session: tuple[OAuthSession, Path],
+    ) -> None:
+        _, session_path = fresh_session
+        cc_request = {
+            "model": "gpt-5.4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": False,
+            "_resolved_key": str(session_path),
+        }
+
+        from kitty.providers.base import ProviderError
+
+        mock_resp = _make_mock_codex_response(status_code=403, text=_CLOUDFLARE_HTML)
+        with _mock_curl_session(mock_resp):
+            with pytest.raises(ProviderError, match="[Cc]loudflare"):
+                await adapter.make_request(cc_request)
+
+
+# ── Basic request methods ────────────────────────────────────────────────
+
+class TestStreamRequestBasic:
+    """Test successful streaming via curl_cffi."""
+
+    @pytest.mark.asyncio()
+    async def test_streams_sse_chunks(
+        self, adapter: OpenAISubscriptionAdapter, fresh_session: tuple[OAuthSession, Path],
+    ) -> None:
+        _, session_path = fresh_session
+        cc_request = {
+            "model": "gpt-5.4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+            "_resolved_key": str(session_path),
+        }
+        written: list[bytes] = []
+
+        async def mock_write(data: bytes) -> None:
+            written.append(data)
+
+        sse_chunks = [
+            b'data: {"type":"response.output_text.delta","delta":"Hello"}\n\n',
+            b'data: {"type":"response.output_text.delta","delta":" world"}\n\n',
+            b'data: [DONE]\n\n',
+        ]
+        mock_resp = _make_streaming_codex_response(status_code=200, chunks=sse_chunks)
+        with _mock_curl_session(mock_resp):
+            await adapter.stream_request(cc_request, mock_write)
+
+        assert len(written) == 3
+        assert b'"delta":"Hello"' in written[0]
+        assert b'"delta":" world"' in written[1]
+
+    @pytest.mark.asyncio()
+    async def test_strips_bom_from_chunks(
+        self, adapter: OpenAISubscriptionAdapter, fresh_session: tuple[OAuthSession, Path],
+    ) -> None:
+        _, session_path = fresh_session
+        cc_request = {
+            "model": "gpt-5.4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+            "_resolved_key": str(session_path),
+        }
+        written: list[bytes] = []
+
+        async def mock_write(data: bytes) -> None:
+            written.append(data)
+
+        # Chunk with UTF-8 BOM prefix
+        sse_chunks = [
+            b'\xef\xbb\xbfdata: {"type":"response.output_text.delta","delta":"Hi"}\n\n',
+        ]
+        mock_resp = _make_streaming_codex_response(status_code=200, chunks=sse_chunks)
+        with _mock_curl_session(mock_resp):
+            await adapter.stream_request(cc_request, mock_write)
+
+        # BOM should be stripped
+        assert written[0] == b'data: {"type":"response.output_text.delta","delta":"Hi"}\n\n'
+
+
+class TestMakeRequestBasic:
+    """Test successful non-streaming request via curl_cffi."""
+
+    @pytest.mark.asyncio()
+    async def test_parses_sse_to_cc_response(
+        self, adapter: OpenAISubscriptionAdapter, fresh_session: tuple[OAuthSession, Path],
+    ) -> None:
+        _, session_path = fresh_session
+        cc_request = {
+            "model": "gpt-5.4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": False,
+            "_resolved_key": str(session_path),
+        }
+
+        sse_body = (
+            b'data: {"type":"response.output_text.delta","delta":"Hello"}\n\n'
+            b'data: {"type":"response.completed","response":{"model":"gpt-5.4","status":"completed","usage":{"input_tokens":10,"output_tokens":5}}}\n\n'
+            b'data: [DONE]\n\n'
+        )
+        mock_resp = _make_mock_codex_response(status_code=200, content=sse_body)
+        with _mock_curl_session(mock_resp):
+            result = await adapter.make_request(cc_request)
+
+        assert result["object"] == "chat.completion"
+        assert result["model"] == "gpt-5.4"
+        assert result["choices"][0]["message"]["content"] == "Hello"
+        assert result["choices"][0]["finish_reason"] == "stop"
+        assert result["usage"]["input_tokens"] == 10
