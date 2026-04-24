@@ -784,3 +784,90 @@ class TestEditProfileFlowOAuth:
         assert saved is not None
         assert saved.model == "new-model"
         assert saved.auth_ref == old_auth_ref
+
+
+# ---------------------------------------------------------------------------
+# _create_profile_flow — custom URL providers (Custom OpenAI-Compatible)
+# ---------------------------------------------------------------------------
+
+class TestCreateProfileFlowCustomURL:
+    def test_prompts_for_base_url_and_creates_profile(self, store: ProfileStore, cred_store: CredentialStore) -> None:
+        """Custom URL provider prompts for base URL, stores it in provider_config."""
+        create = _import_create_profile_flow()
+        with (
+            patch("kitty.cli.profile_cmd.SelectionMenu.show", return_value="custom_openai"),
+            patch("kitty.cli.profile_cmd._find_reusable_auth_ref", return_value=None),
+            patch("kitty.cli.profile_cmd.prompt_text", side_effect=[
+                "https://api.deepseek.com/v1",  # base URL
+                "deepseek-chat",                  # model
+                "my-deepseek",                    # profile name
+            ]),
+            patch("kitty.cli.profile_cmd.prompt_secret", return_value="sk-deepseek-key"),
+            patch("kitty.cli.profile_cmd.prompt_confirm", return_value=True),
+        ):
+            profile = create(store, cred_store)
+
+        assert profile.provider == "custom_openai"
+        assert profile.model == "deepseek-chat"
+        assert profile.name == "my-deepseek"
+        assert profile.provider_config == {"base_url": "https://api.deepseek.com/v1"}
+        assert cred_store.get(profile.auth_ref) == "sk-deepseek-key"
+
+    def test_empty_base_url_rejected_then_accepted(self, store: ProfileStore, cred_store: CredentialStore) -> None:
+        """Empty base URL is rejected with error, user re-prompted."""
+        create = _import_create_profile_flow()
+        with (
+            patch("kitty.cli.profile_cmd.SelectionMenu.show", return_value="custom_openai"),
+            patch("kitty.cli.profile_cmd._find_reusable_auth_ref", return_value=None),
+            patch("kitty.cli.profile_cmd.prompt_text", side_effect=[
+                "",                                   # empty base URL → rejected
+                "https://api.deepseek.com/v1",        # valid base URL
+                "deepseek-chat",                      # model
+                "my-profile",                         # profile name
+            ]),
+            patch("kitty.cli.profile_cmd.prompt_secret", return_value="sk-key"),
+            patch("kitty.cli.profile_cmd.prompt_confirm", return_value=True),
+            patch("kitty.cli.profile_cmd.print_error") as mock_error,
+        ):
+            profile = create(store, cred_store)
+
+        mock_error.assert_called_once()
+        assert "Base URL" in mock_error.call_args[0][0] or "base URL" in mock_error.call_args[0][0]
+        assert profile.provider_config == {"base_url": "https://api.deepseek.com/v1"}
+
+    def test_http_base_url_allowed(self, store: ProfileStore, cred_store: CredentialStore) -> None:
+        """HTTP base URL is accepted (e.g. local vLLM, unlike Profile.base_url which is HTTPS-only)."""
+        create = _import_create_profile_flow()
+        with (
+            patch("kitty.cli.profile_cmd.SelectionMenu.show", return_value="custom_openai"),
+            patch("kitty.cli.profile_cmd._find_reusable_auth_ref", return_value=None),
+            patch("kitty.cli.profile_cmd.prompt_text", side_effect=[
+                "http://localhost:8000/v1",  # HTTP base URL
+                "llama3.2",                  # model
+                "local-llm",                 # profile name
+            ]),
+            patch("kitty.cli.profile_cmd.prompt_secret", return_value="not-needed"),
+            patch("kitty.cli.profile_cmd.prompt_confirm", return_value=True),
+        ):
+            profile = create(store, cred_store)
+
+        assert profile.provider_config == {"base_url": "http://localhost:8000/v1"}
+
+    def test_non_custom_url_provider_skips_base_url_prompt(
+        self, store: ProfileStore, cred_store: CredentialStore,
+    ) -> None:
+        """Regular provider (e.g. zai_regular) does NOT get prompted for base URL."""
+        create = _import_create_profile_flow()
+        with (
+            patch("kitty.cli.profile_cmd.SelectionMenu.show", return_value="zai_regular"),
+            patch("kitty.cli.profile_cmd._find_reusable_auth_ref", return_value=None),
+            patch("kitty.cli.profile_cmd.prompt_text", side_effect=["gpt-4o", "regular-profile"]) as mock_text,
+            patch("kitty.cli.profile_cmd.prompt_secret", return_value="sk-key"),
+            patch("kitty.cli.profile_cmd.prompt_confirm", return_value=True),
+        ):
+            profile = create(store, cred_store)
+
+        # prompt_text should be called exactly twice: model + name (not base URL)
+        assert mock_text.call_count == 2
+        assert profile.provider_config == {}
+

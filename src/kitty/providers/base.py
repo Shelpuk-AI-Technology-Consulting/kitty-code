@@ -182,6 +182,15 @@ class ProviderAdapter(ABC):
         return "test"
 
     @property
+    def requires_custom_url(self) -> bool:
+        """Whether this provider requires a custom base URL from the user.
+
+        When True, the profile creation flow prompts for a base URL and
+        stores it in ``provider_config["base_url"]``.
+        """
+        return False
+
+    @property
     def requires_oauth(self) -> bool:
         """Whether this provider uses OAuth instead of a static API key.
 

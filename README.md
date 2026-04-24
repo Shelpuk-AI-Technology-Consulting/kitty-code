@@ -175,6 +175,36 @@ Point your tool at `http://localhost:<port>` and it just works.
 | AWS Bedrock | `bedrock` | Uses boto3 SigV4 auth |
 | Azure OpenAI | `azure` | Requires deployment name |
 | Google Vertex AI | `vertex` | Requires project and location |
+| **Custom OpenAI-Compatible** | `custom_openai` | Any service with a `/v1/chat/completions` endpoint — see below |
+
+### Custom OpenAI-Compatible Provider
+
+Use the `custom_openai` provider to connect to **any** service that exposes an OpenAI-compatible Chat Completions API. This works with DeepSeek, Together AI, Groq, vLLM, LM Studio, and any other service that accepts `POST /v1/chat/completions` with Bearer auth and SSE streaming.
+
+```bash
+$ kitty setup
+  ? Provider: Custom OpenAI-Compatible
+  ? API base URL: https://api.deepseek.com/v1
+  ? Model: deepseek-chat
+  ? API key: ********
+
+$ kitty claude
+  ✓ Bridge running on port <random_port>
+  ✓ Claude Code launched
+```
+
+**Common endpoints:**
+
+| Service | Base URL |
+|---------|----------|
+| DeepSeek | `https://api.deepseek.com/v1` |
+| Together AI | `https://api.together.xyz/v1` |
+| Groq | `https://api.groq.com/openai/v1` |
+| Fireworks | `https://api.fireworks.ai/inference/v1` |
+| vLLM (local) | `http://localhost:8000/v1` |
+| LM Studio | `http://localhost:1234/v1` |
+
+Both HTTPS and HTTP (local) endpoints are supported.
 
 ## Commands
 

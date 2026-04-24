@@ -7,6 +7,7 @@ from kitty.providers.azure import AzureOpenAIAdapter
 from kitty.providers.base import ProviderAdapter
 from kitty.providers.bedrock import BedrockAdapter
 from kitty.providers.byteplus import BytePlusAdapter
+from kitty.providers.custom_openai import CustomOpenAIAdapter
 from kitty.providers.fireworks import FireworksAdapter
 from kitty.providers.google_aistudio import GoogleAIStudioAdapter
 from kitty.providers.kimi import KimiCodeAdapter
@@ -37,6 +38,7 @@ _registry: dict[str, type[ProviderAdapter]] = {
     "fireworks": FireworksAdapter,
     "google_aistudio": GoogleAIStudioAdapter,
     "opencode_go": OpenCodeGoAdapter,
+    "custom_openai": CustomOpenAIAdapter,
     "kimi": KimiCodeAdapter,
     "mimo": MimoAdapter,
     "byteplus": BytePlusAdapter,

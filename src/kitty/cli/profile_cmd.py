@@ -145,6 +145,16 @@ def _create_profile_flow(store: ProfileStore, cred_store: CredentialStore) -> Pr
     from kitty.providers.registry import get_provider as _get_provider
     provider_adapter = _get_provider(provider)
 
+    # Step 2a: Custom base URL (for providers that require user-specified endpoint)
+    provider_config: dict = {}
+    if provider_adapter.requires_custom_url:
+        while True:
+            base_url = prompt_text("API base URL (e.g. https://api.deepseek.com/v1): ")
+            if base_url and base_url.strip():
+                provider_config = {"base_url": base_url.strip()}
+                break
+            print_error("Base URL is required for this provider")
+
     if provider_adapter.requires_oauth:
         # OAuth path: launch browser flow
         from kitty.cli.auth_cmd import run_oauth_for_provider
@@ -212,6 +222,7 @@ def _create_profile_flow(store: ProfileStore, cred_store: CredentialStore) -> Pr
         provider=provider,  # type: ignore[arg-type]
         model=model,
         auth_ref=auth_ref,
+        provider_config=provider_config,
         is_default=set_default,
     )
     store.save(profile)

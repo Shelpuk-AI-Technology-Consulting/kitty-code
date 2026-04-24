@@ -32,6 +32,7 @@ _PROVIDER_TYPES = Literal[
     "fireworks",
     "google_aistudio",
     "opencode_go",
+    "custom_openai",
     "kimi",
     "mimo",
     "byteplus",
@@ -44,6 +45,7 @@ PROVIDER_LABELS: dict[str, str] = {
     "kimi": "Kimi Code",
     "mimo": "Xiaomi MiMo",
     "openai_subscription": "OpenAI ChatGPT (subscription)",
+    "custom_openai": "Custom OpenAI-Compatible",
 }
 
 
