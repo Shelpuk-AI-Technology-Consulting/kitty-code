@@ -5,19 +5,17 @@ from __future__ import annotations
 import contextlib
 import json
 import time
+import unittest.mock
+from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import AsyncIterator
 
 import pytest
-
-import unittest.mock
 
 from kitty.auth.oauth_session import OAuthSession
 from kitty.providers.openai_subscription import (
     _CODEX_BACKEND_URL,
     OpenAISubscriptionAdapter,
 )
-
 
 # ── Async mock helpers ────────────────────────────────────────────────────
 
@@ -38,7 +36,6 @@ def _make_mock_codex_response(
     mock_resp.status_code = status_code
     mock_resp.text = text
     mock_resp.content = content if content is not None else text.encode()
-    mock_resp.close = unittest.mock.MagicMock()
     return mock_resp
 
 
@@ -50,7 +47,6 @@ def _make_streaming_codex_response(
     mock_resp.status_code = status_code
     mock_resp.text = b"".join(chunks).decode("utf-8", errors="replace")
     mock_resp.content = b"".join(chunks)
-    mock_resp.close = unittest.mock.MagicMock()
 
     async def _aiter_content():
         for chunk in chunks:
@@ -483,9 +479,8 @@ class TestMakeRequestCloudflare:
         from kitty.providers.base import ProviderError
 
         mock_resp = _make_mock_codex_response(status_code=403, text=_CLOUDFLARE_HTML)
-        with _mock_curl_session(mock_resp):
-            with pytest.raises(ProviderError, match="[Cc]loudflare"):
-                await adapter.make_request(cc_request)
+        with _mock_curl_session(mock_resp), pytest.raises(ProviderError, match="[Cc]loudflare"):
+            await adapter.make_request(cc_request)
 
 
 # ── Basic request methods ────────────────────────────────────────────────
@@ -567,7 +562,8 @@ class TestMakeRequestBasic:
 
         sse_body = (
             b'data: {"type":"response.output_text.delta","delta":"Hello"}\n\n'
-            b'data: {"type":"response.completed","response":{"model":"gpt-5.4","status":"completed","usage":{"input_tokens":10,"output_tokens":5}}}\n\n'
+            b'data: {"type":"response.completed","response":{"model":"gpt-5.4",'
+            b'"status":"completed","usage":{"input_tokens":10,"output_tokens":5}}}\n\n'
             b'data: [DONE]\n\n'
         )
         mock_resp = _make_mock_codex_response(status_code=200, content=sse_body)
@@ -579,3 +575,82 @@ class TestMakeRequestBasic:
         assert result["choices"][0]["message"]["content"] == "Hello"
         assert result["choices"][0]["finish_reason"] == "stop"
         assert result["usage"]["input_tokens"] == 10
+
+
+# ── Regression guards ────────────────────────────────────────────────────
+
+class TestNoManualResponseClose:
+    """Guard against accidentally adding resp.close() calls.
+
+    curl_cffi's internal cleanup callback releases handles back to the
+    session pool.  Calling resp.close() frees the curl handle, causing a
+    TypeError when the cleanup callback subsequently tries to release it.
+    """
+
+    @pytest.mark.asyncio()
+    async def test_stream_request_does_not_close_response(
+        self, adapter: OpenAISubscriptionAdapter, fresh_session: tuple[OAuthSession, Path],
+    ) -> None:
+        _, session_path = fresh_session
+        cc_request = {
+            "model": "gpt-5.4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+            "_resolved_key": str(session_path),
+        }
+        written: list[bytes] = []
+
+        async def mock_write(data: bytes) -> None:
+            written.append(data)
+
+        sse_chunks = [b'data: {"type":"response.output_text.delta","delta":"X"}\n\n']
+        mock_resp = _make_streaming_codex_response(status_code=200, chunks=sse_chunks)
+        with _mock_curl_session(mock_resp):
+            await adapter.stream_request(cc_request, mock_write)
+
+        mock_resp.close.assert_not_called()
+
+    @pytest.mark.asyncio()
+    async def test_make_request_does_not_close_response(
+        self, adapter: OpenAISubscriptionAdapter, fresh_session: tuple[OAuthSession, Path],
+    ) -> None:
+        _, session_path = fresh_session
+        cc_request = {
+            "model": "gpt-5.4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": False,
+            "_resolved_key": str(session_path),
+        }
+
+        sse_body = (
+            b'data: {"type":"response.completed","response":'
+            b'{"model":"gpt-5.4","status":"completed"}}\n\n'
+            b'data: [DONE]\n\n'
+        )
+        mock_resp = _make_mock_codex_response(status_code=200, content=sse_body)
+        with _mock_curl_session(mock_resp):
+            await adapter.make_request(cc_request)
+
+        mock_resp.close.assert_not_called()
+
+
+class TestEmptyResponseBody:
+    """Guard against empty SSE body silently producing a valid response."""
+
+    @pytest.mark.asyncio()
+    async def test_make_request_raises_on_empty_body(
+        self, adapter: OpenAISubscriptionAdapter, fresh_session: tuple[OAuthSession, Path],
+    ) -> None:
+        _, session_path = fresh_session
+        cc_request = {
+            "model": "gpt-5.4",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": False,
+            "_resolved_key": str(session_path),
+        }
+
+        from kitty.providers.base import ProviderError
+
+        mock_resp = _make_mock_codex_response(status_code=200, content=b"")
+        with _mock_curl_session(mock_resp), pytest.raises(ProviderError, match="empty response"):
+            await adapter.make_request(cc_request)

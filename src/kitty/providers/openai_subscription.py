@@ -292,25 +292,26 @@ class OpenAISubscriptionAdapter(OpenAIAdapter):
         except Exception as exc:
             raise self._handle_curl_error(exc) from exc
 
-        try:
-            if resp.status_code >= 400:
-                raw = resp.text
-                if self._is_cloudflare_block(resp.status_code, raw):
-                    logger.warning("Codex backend blocked by Cloudflare challenge")
-                    raise self.map_error(resp.status_code, {"error": {"message": raw}})
-                body = {}
-                with contextlib.suppress(Exception):
-                    body = json.loads(raw)
-                if not body:
-                    body = {"error": {"message": raw}}
-                raise self.map_error(resp.status_code, body)
-
-            # Read the full streamed response
-            return self._parse_sse_to_response(resp.content)
-        finally:
-            # Release the connection back to the pool.
+        if resp.status_code >= 400:
+            raw = resp.text
+            if self._is_cloudflare_block(resp.status_code, raw):
+                logger.warning("Codex backend blocked by Cloudflare challenge")
+                raise self.map_error(resp.status_code, {"error": {"message": raw}})
+            body = {}
             with contextlib.suppress(Exception):
-                resp.close()
+                body = json.loads(raw)
+            if not body:
+                body = {"error": {"message": raw}}
+            raise self.map_error(resp.status_code, body)
+
+        # Read the full streamed response.  Do NOT call resp.close() —
+        # curl_cffi's internal cleanup callback releases the handle back to
+        # the session pool.  Calling close() frees the curl handle, causing a
+        # TypeError when the cleanup callback subsequently tries to release it.
+        raw = resp.content
+        if not raw:
+            raise ProviderError("Codex backend returned an empty response body")
+        return self._parse_sse_to_response(raw)
 
     async def stream_request(
         self,
@@ -367,33 +368,29 @@ class OpenAISubscriptionAdapter(OpenAIAdapter):
         except Exception as exc:
             raise self._handle_curl_error(exc) from exc
 
-        try:
-            if resp.status_code >= 400:
-                raw = resp.text
-                if self._is_cloudflare_block(resp.status_code, raw):
-                    logger.warning("Codex backend blocked by Cloudflare challenge")
-                    raise self.map_error(resp.status_code, {"error": {"message": raw}})
-                body = {}
-                with contextlib.suppress(Exception):
-                    body = json.loads(raw)
-                # Log raw response at DEBUG level for diagnosis
-                logger.debug("Codex backend error %d: %s", resp.status_code, raw[:500])
-                if not body:
-                    body = {"error": {"message": raw}}
-                raise self.map_error(resp.status_code, body)
-
-            async for chunk in resp.aiter_content():
-                if chunk:
-                    # Strip UTF-8 BOM that some responses include
-                    cleaned = chunk.replace(b"\xef\xbb\xbf", b"")
-                    if cleaned:
-                        await write(cleaned)
-        finally:
-            # Release the connection back to the pool without closing the
-            # session.  Wrapped in suppress to avoid issues with already-closed
-            # or incomplete streams (curl_cffi segfault mitigation, issue #675).
+        if resp.status_code >= 400:
+            raw = resp.text
+            if self._is_cloudflare_block(resp.status_code, raw):
+                logger.warning("Codex backend blocked by Cloudflare challenge")
+                raise self.map_error(resp.status_code, {"error": {"message": raw}})
+            body = {}
             with contextlib.suppress(Exception):
-                resp.close()
+                body = json.loads(raw)
+            # Log raw response at DEBUG level for diagnosis
+            logger.debug("Codex backend error %d: %s", resp.status_code, raw[:500])
+            if not body:
+                body = {"error": {"message": raw}}
+            raise self.map_error(resp.status_code, body)
+
+        # Stream SSE chunks to the downstream client.  Do NOT call
+        # resp.close() — curl_cffi's internal cleanup callback releases
+        # the handle back to the session pool when the stream task completes.
+        async for chunk in resp.aiter_content():
+            if chunk:
+                # Strip UTF-8 BOM that some responses include
+                cleaned = chunk.replace(b"\xef\xbb\xbf", b"")
+                if cleaned:
+                    await write(cleaned)
 
     def _cc_to_responses(self, cc_request: dict) -> dict:
         """Convert a CC (Chat Completions) request to Responses API format.
