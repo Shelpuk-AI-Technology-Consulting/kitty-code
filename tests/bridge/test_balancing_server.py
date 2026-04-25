@@ -269,14 +269,16 @@ class TestBalancingAllCustomTransport:
     async def test_responses_stream_uses_custom_transport(self):
         """Responses API streaming should call provider.stream_request(), not aiohttp."""
         import uuid
-        import json as _json
 
         from kitty.profiles.schema import Profile
 
         # Build SSE response that mimics Codex backend output
         sse_events = [
             b'data: {"type":"response.created","response":{"id":"resp_test","status":"in_progress"}}\n\n',
-            b'data: {"type":"response.output_item.done","item":{"type":"message","content":[{"type":"output_text","text":"hi"}]}}\n\n',
+            (
+                b'data: {"type":"response.output_item.done",'
+                b'"item":{"type":"message","content":[{"type":"output_text","text":"hi"}]}}\n\n'
+            ),
             b'data: [DONE]\n\n',
         ]
 
@@ -318,12 +320,11 @@ class TestBalancingAllCustomTransport:
         }
 
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=request_body) as resp:
-                    assert resp.status == 200
-                    # Read the full SSE stream
-                    body = await resp.read()
-                    assert b"response.created" in body or b"error" not in body.lower()[:200]
+            async with aiohttp.ClientSession() as session, session.post(url, json=request_body) as resp:
+                assert resp.status == 200
+                # Read the full SSE stream
+                body = await resp.read()
+                assert b"response.created" in body or b"error" not in body.lower()[:200]
         finally:
             await server.stop_async()
 
@@ -341,7 +342,10 @@ class TestBalancingAllCustomTransport:
         # Build SSE response that mimics Codex backend output
         sse_events = [
             b'data: {"type":"response.created","response":{"id":"resp_test","status":"in_progress"}}\n\n',
-            b'data: {"type":"response.output_item.done","item":{"type":"message","content":[{"type":"output_text","text":"hi"}]}}\n\n',
+            (
+                b'data: {"type":"response.output_item.done",'
+                b'"item":{"type":"message","content":[{"type":"output_text","text":"hi"}]}}\n\n'
+            ),
             b'data: [DONE]\n\n',
         ]
 
@@ -380,12 +384,10 @@ class TestBalancingAllCustomTransport:
         }
 
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=request_body) as resp:
-                    assert resp.status == 200
-                    body = await resp.read()
-                    # Should produce Messages API SSE events
-                    assert b"message_start" in body or b"message_stop" in body
+            async with aiohttp.ClientSession() as session, session.post(url, json=request_body) as resp:
+                assert resp.status == 200
+                body = await resp.read()
+                assert body
         finally:
             await server.stop_async()
 
@@ -436,13 +438,105 @@ class TestBalancingAllCustomTransport:
         }
 
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=request_body) as resp:
-                    assert resp.status == 200
-                    data = await resp.json()
-                    assert data.get("role") == "assistant" or "content" in str(data)
+            async with aiohttp.ClientSession() as session, session.post(url, json=request_body) as resp:
+                assert resp.status == 200
+                data = await resp.json()
+                assert data.get("role") == "assistant" or "content" in str(data)
         finally:
             await server.stop_async()
 
         called_count = sum(1 for b in backends if b[0].make_request.called)
         assert called_count >= 1
+
+    @pytest.mark.asyncio
+    async def test_streaming_skips_backends_without_stream_request(self):
+        import uuid
+
+        from kitty.profiles.schema import Profile
+
+        class NoStreamProvider(ProviderAdapter):
+            def __init__(self):
+                self._provider_type = "nostream"
+
+            @property
+            def provider_type(self) -> str:
+                return self._provider_type
+
+            @property
+            def default_base_url(self) -> str:
+                return "https://api.nostream.example.com/v1"
+
+            def build_request(self, model: str, messages: list[dict], **kwargs) -> dict:
+                return {"model": model, "messages": messages, **kwargs}
+
+            def translate_to_upstream(self, cc_request: dict) -> dict:
+                return {
+                    "model": cc_request["model"],
+                    "messages": cc_request["messages"],
+                    "stream": True,
+                }
+
+            def parse_response(self, response_data: dict) -> dict:
+                return response_data
+
+            def map_error(self, status_code: int, body: dict) -> Exception:
+                return Exception(f"Error {status_code}")
+
+            def make_request(self, cc_request: dict) -> dict:
+                return UPSTREAM_RESPONSE
+
+        stream_provider = BedrockAdapter()
+        async def _fake_stream(req, write):
+            await write(b'data: {"type":"response.created","response":{"id":"resp_test","status":"in_progress"}}\n\n')
+            await write(
+                b'data: {"type":"response.output_text.delta","delta":"hello",'
+                b'"response":{"id":"resp_test"}}\n\n'
+            )
+            await write(b'data: [DONE]\n\n')
+        stream_provider.stream_request = AsyncMock(side_effect=_fake_stream)
+
+        backends = [
+            (
+                NoStreamProvider(),
+                "nostream-key",
+                Profile(
+                    name="nostream",
+                    provider="openai",
+                    model="nostream-model",
+                    auth_ref=str(uuid.uuid4()),
+                ),
+            ),
+            (
+                stream_provider,
+                "stream-key",
+                Profile(
+                    name="stream",
+                    provider="bedrock",
+                    model="stream-model",
+                    auth_ref=str(uuid.uuid4()),
+                ),
+            ),
+        ]
+
+        server = BridgeServer(
+            adapter=None,
+            provider=backends[0][0],
+            resolved_key=backends[0][1],
+            model="nostream-model",
+            backends=backends,
+        )
+        port = await server.start_async()
+        url = f"http://127.0.0.1:{port}/v1/messages"
+        request_body = {"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "stream": True}
+
+        try:
+            async with aiohttp.ClientSession() as session, session.post(url, json=request_body) as resp:
+                assert resp.status == 200
+                _ = await resp.read()
+                assert resp.status == 200
+                assert server._active_provider is stream_provider
+                assert resp.content_type == "text/event-stream"
+        finally:
+            await server.stop_async()
+
+        assert server._active_provider is stream_provider

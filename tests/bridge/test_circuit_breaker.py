@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import random
 import time
 import uuid
 
@@ -66,14 +67,28 @@ UPSTREAM_OK = {
 }
 
 
-def _make_backends(n: int) -> list:
+def _make_backends(n: int, provider_types: list[str] | None = None) -> list:
     backends = []
     for i in range(n):
-        provider = StubProvider(provider_type=f"stub-{i}", base_url=f"https://api{i}.example.com/v1")
+        provider_type = provider_types[i] if provider_types is not None else f"stub-{i}"
+        provider = StubProvider(provider_type=provider_type, base_url=f"https://api{i}.example.com/v1")
         key = f"key-{i}"
         profile = Profile(name=f"profile-{i}", provider="openai", model=f"model-{i}", auth_ref=str(uuid.uuid4()))
         backends.append((provider, key, profile))
     return backends
+
+
+def _make_server_with_families(provider_types: list[str], cooldown: int = 300) -> BridgeServer:
+    backends = _make_backends(len(provider_types), provider_types=provider_types)
+    server = BridgeServer(
+        adapter=StubLauncher(),
+        provider=backends[0][0],
+        resolved_key=backends[0][1],
+        model="model-0",
+        backends=backends,
+        backend_cooldown=cooldown,
+    )
+    return server
 
 
 def _make_server(n_backends: int = 3, cooldown: int = 300) -> BridgeServer:
@@ -142,13 +157,91 @@ class TestGetNextBackendHealthAware:
             _, key, _, _, _ = server._get_next_backend()
             assert key in ("key-0", "key-2"), f"Got {key}, expected only key-0 or key-2"
 
+
+class TestFailureWeightedSelection:
+    """Backends with more failures should be selected less often among healthy peers."""
+
+    def test_repeatedly_failing_backend_deprioritized(self):
+        """A backend that has failed 5 times should be selected much less often than one that never failed."""
+        server = _make_server(3, cooldown=0)
+
+        # Simulate backend-0 failing 5 times and recovering each time
+        for _ in range(5):
+            server._mark_backend_unhealthy(0)
+
+        # All backends are healthy (cooldown=0), but backend-0 has 5 failures
+        for h in server._backend_health:
+            h["healthy"] = True
+            h["failed_at"] = None
+
+        random.seed(42)
+        counts = {"key-0": 0, "key-1": 0, "key-2": 0}
+        for _ in range(300):
+            _, key, _, _, _ = server._get_next_backend()
+            counts[key] += 1
+
+        # Backend-0 should be selected less often than either of the healthy peers
+        assert counts["key-0"] < counts["key-1"], f"key-0 ({counts['key-0']}) should be < key-1 ({counts['key-1']})"
+        assert counts["key-0"] < counts["key-2"], f"key-0 ({counts['key-0']}) should be < key-2 ({counts['key-2']}"
+
+    def test_failure_count_increments_on_mark_unhealthy(self):
+        """_mark_backend_unhealthy should track cumulative failure count."""
+        server = _make_server(3)
+        assert server._backend_health[0].get("failure_count", 0) == 0
+
+        server._mark_backend_unhealthy(0)
+        assert server._backend_health[0]["failure_count"] == 1
+
+        server._mark_backend_unhealthy(0)
+        assert server._backend_health[0]["failure_count"] == 2
+
+    def test_failure_count_persists_across_recovery(self):
+        """Failure count should persist even after cooldown expires and backend recovers."""
+        server = _make_server(3, cooldown=0)
+
+        server._mark_backend_unhealthy(0)
+        server._mark_backend_unhealthy(0)
+        assert server._backend_health[0]["failure_count"] == 2
+
+        # Backend recovers (cooldown=0)
+        server._backend_health[0]["healthy"] = True
+        server._backend_health[0]["failed_at"] = None
+
+        # failure_count should still be 2, not reset
+        assert server._backend_health[0]["failure_count"] == 2
+
+    def test_equal_failure_counts_give_equal_selection(self):
+        """Backends with equal failure counts should be selected equally."""
+        server = _make_server(2, cooldown=0)
+
+        server._mark_backend_unhealthy(0)
+        server._mark_backend_unhealthy(1)
+
+        # Both recovered
+        for h in server._backend_health:
+            h["healthy"] = True
+            h["failed_at"] = None
+
+        random.seed(42)
+        counts = {"key-0": 0, "key-1": 0}
+        for _ in range(200):
+            _, key, _, _, _ = server._get_next_backend()
+            counts[key] += 1
+
+        # Should be roughly equal (allow 30% tolerance)
+        ratio = counts["key-0"] / counts["key-1"]
+        assert 0.7 <= ratio <= 1.3, f"Selection ratio {ratio} too skewed: {counts}"
+
     def test_cooldown_expired_backend_recovers(self):
+        import random as _random
+
         server = _make_server(3, cooldown=0)  # Instant cooldown
         server._mark_backend_unhealthy(1)
 
         # With cooldown=0, backend should recover immediately
+        _random.seed(42)
         keys = []
-        for _ in range(6):
+        for _ in range(30):
             _, key, _, _, _ = server._get_next_backend()
             keys.append(key)
         # All three backends should be used
@@ -222,6 +315,200 @@ class TestCircuitBreakerRetry:
                 assert body["choices"][0]["message"]["content"] == "Hello!"
 
         await server.stop_async()
+
+    @pytest.mark.asyncio
+    async def test_first_backend_429_fails_over_to_second(self):
+        """Backend-0 returns 429, backend-1 succeeds — balancing mode fails over."""
+        server = _make_server(2)
+        port = await server.start_async()
+        url = f"http://127.0.0.1:{port}/v1/chat/completions"
+
+        request_body = {
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+        }
+
+        sse_body = (
+            b'data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{"content":"Hello!"},"finish_reason":null}],'
+            b'"model":"test-model"}\n\n'
+            b'data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],'
+            b'"model":"test-model"}\n\n'
+            b'data: [DONE]\n\n'
+        )
+
+        with aioresponses(passthrough=["http://127.0.0.1"]) as m:
+            m.post(
+                "https://api0.example.com/v1/chat/completions",
+                status=429,
+                payload={"error": {"message": "Rate limited"}},
+            )
+            m.post(
+                "https://api1.example.com/v1/chat/completions",
+                body=sse_body,
+                headers={"Content-Type": "text/event-stream"},
+            )
+
+            async with aiohttp.ClientSession() as session, session.post(url, json=request_body) as resp:
+                assert resp.status == 200
+                body = await resp.read()
+                assert b"Hello!" in body
+                assert b'"finish_reason":"stop"' in body
+                assert b"[DONE]" in body
+
+        await server.stop_async()
+
+    @pytest.mark.asyncio
+    async def test_first_backend_429_non_streaming_fails_over_to_second(self):
+        """Backend-0 returns 429, backend-1 succeeds — non-streaming balancing fails over immediately.
+
+        Only ONE 429 mock is registered for backend-0. If the bridge retries 429 on the
+        same backend, aioresponses will raise and the test fails — proving the bridge
+        must fail over to backend-1 after a single 429.
+        """
+        server = _make_server(2)
+        port = await server.start_async()
+        url = f"http://127.0.0.1:{port}/v1/chat/completions"
+
+        request_body = {
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+
+        with aioresponses(passthrough=["http://127.0.0.1"]) as m:
+            # Only ONE 429 response for backend-0 — must fail over immediately
+            m.post(
+                "https://api0.example.com/v1/chat/completions",
+                status=429,
+                payload={"error": {"message": "Rate limited"}},
+            )
+            m.post("https://api1.example.com/v1/chat/completions", payload=UPSTREAM_OK)
+
+            async with aiohttp.ClientSession() as session, session.post(url, json=request_body) as resp:
+                assert resp.status == 200
+                body = await resp.json()
+                assert body["choices"][0]["message"]["content"] == "Hello!"
+
+        await server.stop_async()
+
+    @pytest.mark.asyncio
+    async def test_non_balancing_429_still_retries(self):
+        """Single-backend mode preserves 429 retry/backoff behavior."""
+        provider = StubProvider()
+        server = BridgeServer(
+            adapter=StubLauncher(),
+            provider=provider,
+            resolved_key="single-key",
+            model="single-model",
+        )
+        port = await server.start_async()
+        url = f"http://127.0.0.1:{port}/v1/chat/completions"
+
+        request_body = {
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+
+        with aioresponses(passthrough=["http://127.0.0.1"]) as m:
+            for _ in range(4):
+                m.post(
+                    "https://api.example.com/v1/chat/completions",
+                    status=429,
+                    payload={"error": {"message": "Rate limited"}},
+                )
+
+            async with aiohttp.ClientSession() as session, session.post(url, json=request_body) as resp:
+                assert resp.status == 429
+
+        await server.stop_async()
+
+    @pytest.mark.asyncio
+    async def test_all_backends_429_propagates_last_error(self):
+        """When all balancing backends return 429, the bridge surfaces an error response."""
+        server = _make_server(2)
+        port = await server.start_async()
+        url = f"http://127.0.0.1:{port}/v1/chat/completions"
+
+        request_body = {
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+
+        with aioresponses(passthrough=["http://127.0.0.1"]) as m:
+            m.post(
+                "https://api0.example.com/v1/chat/completions",
+                status=429,
+                payload={"error": {"message": "Rate limited 0"}},
+            )
+            m.post(
+                "https://api1.example.com/v1/chat/completions",
+                status=429,
+                payload={"error": {"message": "Rate limited 1"}},
+            )
+
+            async with aiohttp.ClientSession() as session, session.post(url, json=request_body) as resp:
+                assert resp.status in (429, 500)
+
+        await server.stop_async()
+
+    @pytest.mark.asyncio
+    async def test_family_429_then_403_avoids_same_family(self):
+        server = _make_server_with_families(["family-a", "family-a", "family-b"])
+        port = await server.start_async()
+        url = f"http://127.0.0.1:{port}/v1/chat/completions"
+
+        request_body = {
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+
+        with aioresponses(passthrough=["http://127.0.0.1"]) as m:
+            m.post(
+                "https://api0.example.com/v1/chat/completions",
+                status=429,
+                payload={"error": {"message": "Rate limited"}},
+            )
+            m.post(
+                "https://api2.example.com/v1/chat/completions",
+                payload=UPSTREAM_OK,
+            )
+
+            async with aiohttp.ClientSession() as session, session.post(url, json=request_body) as resp:
+                assert resp.status == 200
+                body = await resp.json()
+                assert body["choices"][0]["message"]["content"] == "Hello!"
+
+        await server.stop_async()
+
+    def test_family_cooldown_expires_and_recovers(self):
+        server = _make_server_with_families(["family-a", "family-b"], cooldown=0)
+
+        server._mark_backend_unhealthy(0, cooldown=0, failure_kind="rate_limit")
+
+        assert server._get_family_cooldown("family-a") is None
+        _, key, _, _, _ = server._get_next_backend()
+        assert key in ("key-0", "key-1")
+        assert server._backend_health[0]["healthy"] is True
+        assert server._backend_health[0]["failed_at"] is None
+        assert server._backend_health[0]["stream_error_count"] == 0
+
+        seen = set()
+        for _ in range(20):
+            _, key, _, _, _ = server._get_next_backend()
+            seen.add(key)
+        assert "key-0" in seen
+        assert "key-1" in seen
+
+    def test_family_429_then_403_escalates_same_family_cooldown(self):
+        server = _make_server_with_families(["family-a", "family-a", "family-b"])
+        server._mark_backend_unhealthy(0, cooldown=300, failure_kind="rate_limit")
+        first_cooldown = server._get_family_cooldown("family-a")
+        assert first_cooldown is not None
+
+        server._mark_backend_unhealthy(1, cooldown=300, failure_kind="cloudflare")
+        second_cooldown = server._get_family_cooldown("family-a")
+        assert second_cooldown is not None
+        assert second_cooldown > first_cooldown
 
     @pytest.mark.asyncio
     async def test_first_two_fail_third_succeeds(self):
@@ -319,3 +606,235 @@ class TestCircuitBreakerRetry:
                 assert resp.status == 200
 
         await server.stop_async()
+
+
+# -- Step 4: Stream-specific cooldown and pool collapse prevention ------------
+
+
+class TestStreamErrorCooldown:
+    """_get_stream_error_cooldown returns escalating cooldowns for repeated failures."""
+
+    def test_first_stream_error_returns_30s(self):
+        server = _make_server(3)
+        assert server._get_stream_error_cooldown(0) == 30
+
+    def test_second_stream_error_returns_60s(self):
+        server = _make_server(3)
+        # First failure: mark with a short cooldown to increment stream_error_count
+        server._mark_backend_unhealthy(0, cooldown=30)
+        assert server._get_stream_error_cooldown(0) == 60
+
+    def test_third_stream_error_returns_120s(self):
+        server = _make_server(3)
+        server._mark_backend_unhealthy(0, cooldown=30)
+        server._mark_backend_unhealthy(0, cooldown=60)
+        assert server._get_stream_error_cooldown(0) == 120
+
+    def test_fourth_stream_error_returns_240s(self):
+        server = _make_server(3)
+        server._mark_backend_unhealthy(0, cooldown=30)
+        server._mark_backend_unhealthy(0, cooldown=60)
+        server._mark_backend_unhealthy(0, cooldown=120)
+        assert server._get_stream_error_cooldown(0) == 240
+
+    def test_capped_at_backend_cooldown(self):
+        server = _make_server(3, cooldown=100)
+        server._mark_backend_unhealthy(0, cooldown=30)
+        server._mark_backend_unhealthy(0, cooldown=60)
+        server._mark_backend_unhealthy(0, cooldown=100)  # reached cap
+        assert server._get_stream_error_cooldown(0) == 100
+
+    def test_default_failure_resets_stream_error_count(self):
+        """A non-stream failure (no custom cooldown) resets the error count."""
+        server = _make_server(3)
+        server._mark_backend_unhealthy(0, cooldown=30)
+        assert server._backend_health[0]["stream_error_count"] == 1
+        # Hard failure resets
+        server._mark_backend_unhealthy(0)
+        assert server._backend_health[0]["stream_error_count"] == 0
+        assert server._get_stream_error_cooldown(0) == 30
+
+    def test_negative_index_returns_default(self):
+        server = _make_server(3)
+        assert server._get_stream_error_cooldown(-1) == 30
+
+    def test_no_backends_returns_default(self):
+        server = BridgeServer(
+            adapter=StubLauncher(),
+            provider=StubProvider(),
+            resolved_key="key",
+            model="model",
+        )
+        assert server._get_stream_error_cooldown(-1) == 30
+
+
+class TestMarkUnhealthyWithStreamCooldown:
+    """_mark_backend_unhealthy with stream-specific cooldown stores the right values."""
+
+    def test_stream_cooldown_stored(self):
+        server = _make_server(3, cooldown=300)
+        server._mark_backend_unhealthy(0, cooldown=30)
+        assert server._backend_health[0]["cooldown"] == 30
+        assert server._backend_health[0]["stream_error_count"] == 1
+
+    def test_stream_error_count_increments(self):
+        server = _make_server(3, cooldown=300)
+        server._mark_backend_unhealthy(0, cooldown=30)
+        server._mark_backend_unhealthy(0, cooldown=60)
+        assert server._backend_health[0]["stream_error_count"] == 2
+        assert server._backend_health[0]["cooldown"] == 60
+
+    def test_default_cooldown_resets_count(self):
+        server = _make_server(3, cooldown=300)
+        server._mark_backend_unhealthy(0, cooldown=30)
+        server._mark_backend_unhealthy(0)
+        assert server._backend_health[0]["cooldown"] == 300
+        assert server._backend_health[0]["stream_error_count"] == 0
+
+
+class TestTransportErrorCooldown:
+    """Transport / connection-reset failures escalate cooldown on repeated errors."""
+
+    def test_first_transport_error_uses_default_cooldown(self):
+        server = _make_server(3, cooldown=300)
+        assert server._get_transport_error_cooldown(0) == 300
+
+    def test_second_transport_error_escalates(self):
+        server = _make_server(3, cooldown=300)
+        server._mark_backend_unhealthy(0, cooldown=server._get_transport_error_cooldown(0), failure_kind="transport")
+        assert server._get_transport_error_cooldown(0) > 300
+
+    def test_third_transport_error_escalates_further(self):
+        server = _make_server(3, cooldown=300)
+        first = server._get_transport_error_cooldown(0)
+        server._mark_backend_unhealthy(0, cooldown=first, failure_kind="transport")
+        second = server._get_transport_error_cooldown(0)
+        server._mark_backend_unhealthy(0, cooldown=second, failure_kind="transport")
+        assert server._get_transport_error_cooldown(0) > second
+
+    def test_capped_at_double_backend_cooldown(self):
+        server = _make_server(3, cooldown=300)
+        server._backend_health[0]["transport_error_count"] = 10
+        assert server._get_transport_error_cooldown(0) == 600
+
+    def test_hard_failure_resets_transport_error_count(self):
+        server = _make_server(3, cooldown=300)
+        server._mark_backend_unhealthy(0, cooldown=300, failure_kind="transport")
+        assert server._backend_health[0]["transport_error_count"] == 1
+        server._mark_backend_unhealthy(0)
+        assert server._backend_health[0]["transport_error_count"] == 0
+        assert server._get_transport_error_cooldown(0) == 300
+
+
+class TestLeastRecentlyFailedBackend:
+    """When all backends are unhealthy, prefer the one that failed longest ago."""
+
+    def test_prefers_least_recently_failed(self):
+        server = _make_server(3, cooldown=9999)
+        # Mark all unhealthy in sequence with small time gaps
+        server._mark_backend_unhealthy(0)
+        server._backend_health[0]["failed_at"] = time.monotonic() - 10  # 10s ago
+        server._mark_backend_unhealthy(1)
+        server._backend_health[1]["failed_at"] = time.monotonic() - 5  # 5s ago
+        server._mark_backend_unhealthy(2)
+        server._backend_health[2]["failed_at"] = time.monotonic() - 1  # 1s ago
+
+        # Should always pick backend 0 (failed longest ago)
+        for _ in range(10):
+            _, key, _, _, _ = server._get_next_backend()
+            assert key == "key-0", f"Expected key-0 (least recently failed), got {key}"
+
+    def test_two_backends_picks_older(self):
+        server = _make_server(2, cooldown=9999)
+        server._mark_backend_unhealthy(0)
+        server._backend_health[0]["failed_at"] = time.monotonic() - 20
+        server._mark_backend_unhealthy(1)
+        server._backend_health[1]["failed_at"] = time.monotonic() - 1
+
+        _, key, _, _, _ = server._get_next_backend()
+        assert key == "key-0"
+
+
+class TestFamilyCooldown:
+    """Family-level anti-abuse cooldown after 429/403."""
+
+    def test_429_marks_family_cooldown(self):
+        """After a 429, the backend's provider family should be in cooldown."""
+        server = _make_server_with_families(["family-a", "family-a", "family-b"])
+        assert server._get_family_cooldown("family-a") is None
+
+        server._mark_backend_unhealthy(0, cooldown=300, failure_kind="rate_limit")
+        assert server._get_family_cooldown("family-a") is not None
+
+    def test_429_family_cooldown_skips_same_family(self):
+        """After backend-0 gets 429, backend-1 (same family) should be deprioritized."""
+        server = _make_server_with_families(["family-a", "family-a", "family-b"])
+        server._mark_backend_unhealthy(0, cooldown=300, failure_kind="rate_limit")
+
+        # backend-1 is healthy but same family — should prefer backend-2
+        for _ in range(20):
+            _, key, _, _, _ = server._get_next_backend()
+            assert key in ("key-1", "key-2"), f"Got {key}"
+
+        # In practice backend-2 should dominate; allow backend-1 occasionally
+        # since it's still healthy, just deprioritized
+        counts = {"key-1": 0, "key-2": 0}
+        random.seed(42)
+        for _ in range(100):
+            _, key, _, _, _ = server._get_next_backend()
+            counts[key] += 1
+        assert counts["key-2"] > counts["key-1"], (
+            f"family-b backend should dominate: {counts}"
+        )
+
+    def test_different_family_not_affected(self):
+        """A 429 on family-a should not affect family-b backends."""
+        server = _make_server_with_families(["family-a", "family-b"])
+        server._mark_backend_unhealthy(0, cooldown=300, failure_kind="rate_limit")
+
+        # Backend-1 (family-b) should be selected
+        _, key, _, _, _ = server._get_next_backend()
+        assert key == "key-1"
+
+    def test_family_cooldown_expires(self):
+        """Family cooldown should expire based on the cooldown value."""
+        server = _make_server_with_families(["family-a", "family-b"], cooldown=0)
+        server._mark_backend_unhealthy(0, cooldown=0, failure_kind="rate_limit")
+
+        # With cooldown=0, family cooldown should expire immediately
+        _, key, _, _, _ = server._get_next_backend()
+        assert key in ("key-0", "key-1")
+
+    def test_cloudflare_403_escalates_family_cooldown(self):
+        """A Cloudflare 403 should produce a longer family cooldown than a plain 429."""
+        server = _make_server_with_families(["family-a", "family-b"], cooldown=300)
+
+        # First, a 429
+        server._mark_backend_unhealthy(0, cooldown=300, failure_kind="rate_limit")
+        first_cooldown = server._get_family_cooldown("family-a")
+
+        # Then a 403 Cloudflare on same family
+        server._mark_backend_unhealthy(0, cooldown=300, failure_kind="cloudflare")
+        second_cooldown = server._get_family_cooldown("family-a")
+
+        assert second_cooldown > first_cooldown, (
+            f"Cloudflare 403 should escalate: {second_cooldown} vs {first_cooldown}"
+        )
+
+    def test_all_families_unhealthy_still_returns_backend(self):
+        """When all families are in cooldown, still return a backend."""
+        server = _make_server_with_families(["family-a", "family-b"], cooldown=9999)
+        server._mark_backend_unhealthy(0, cooldown=9999, failure_kind="rate_limit")
+        server._mark_backend_unhealthy(1, cooldown=9999, failure_kind="rate_limit")
+
+        _, key, _, _, _ = server._get_next_backend()
+        assert key in ("key-0", "key-1")
+
+    def test_no_backends_has_empty_family_state(self):
+        server = BridgeServer(
+            adapter=StubLauncher(),
+            provider=StubProvider(),
+            resolved_key="key",
+            model="model",
+        )
+        assert server._get_family_cooldown("anything") is None

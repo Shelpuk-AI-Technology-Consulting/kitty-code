@@ -73,6 +73,17 @@ def _is_retryable_exception(exc: Exception) -> bool:
     return False
 
 
+def _is_transport_error(exc: Exception) -> bool:
+    """Return True for connection-reset / transport errors (not timeouts)."""
+    if isinstance(exc, (ConnectionResetError, BrokenPipeError, aiohttp.ClientConnectionError)):
+        return True
+    if isinstance(exc, OSError):
+        return exc.errno in {32, 104}  # EPIPE, ECONNRESET
+    # ProviderError with "connection failed" from custom-transport providers
+    exc_msg = str(exc).lower()
+    return bool("connection failed" in exc_msg or "connection reset" in exc_msg)
+
+
 def _truncate_for_log(text: str, limit: int = 2000) -> str:
     """Truncate long strings for logs while preserving the total original size."""
     if len(text) <= limit:
@@ -168,9 +179,15 @@ class BridgeServer:
                     "failed_at": None,
                     "cooldown": backend_cooldown,
                     "stream_error_count": 0,
+                    "failure_count": 0,
+                    "transport_error_count": 0,
                 }
                 for _ in backends
             ]
+
+        # Family-level anti-abuse cooldown (keyed by provider_type)
+        # Each entry: {"failed_at": float, "cooldown": int, "abuse_count": int}
+        self._family_cooldown: dict[str, dict] = {}
 
         # Active backend for current request (set by _select_backend)
         self._active_provider = provider
@@ -183,11 +200,14 @@ class BridgeServer:
         self._logging_enabled = logging_enabled
         self._usage_log_path = _usage_log_path or (_DEBUG_LOG_DIR / "usage.log")
 
-    def _get_next_backend(self) -> tuple[ProviderAdapter, str, str | None, dict]:
+    def _get_next_backend(self, *, require_streaming: bool = False) -> tuple[ProviderAdapter, str, str | None, dict]:
         """Select a healthy backend at random with equal probability.
 
         Skips backends that are in cooldown (unhealthy). If all backends
         are unhealthy, returns a random one anyway (let it fail naturally).
+
+        When require_streaming is True, excludes backends whose provider does
+        not implement a custom transport stream_request() override.
 
         Returns (provider, resolved_key, model, provider_config, backend_index).
         backend_index is -1 for non-balancing mode.
@@ -199,6 +219,11 @@ class BridgeServer:
             healthy_indices = []
             for idx in range(n):
                 health = self._backend_health[idx]
+                provider = self._backends[idx][0]
+                if require_streaming and type(provider).stream_request is ProviderAdapter.stream_request:
+                    continue
+                if require_streaming and not provider.use_custom_transport:
+                    continue
                 if health["healthy"]:
                     healthy_indices.append(idx)
                 elif health["failed_at"] is not None:
@@ -215,50 +240,110 @@ class BridgeServer:
                         healthy_indices.append(idx)
 
             if healthy_indices:
-                idx = random.choice(healthy_indices)
+                # Weight selection inversely by failure_count so repeatedly
+                # failing backends are deprioritised among healthy peers.
+                # Further deprioritize backends whose provider family is in
+                # anti-abuse cooldown after a 429 or Cloudflare 403.
+                weights = []
+                for i in healthy_indices:
+                    w = 1.0 / (self._backend_health[i].get("failure_count", 0) + 1)
+                    if self._is_family_in_cooldown(i):
+                        w *= 0.01  # strong deprioritization
+                    weights.append(w)
+                idx = random.choices(healthy_indices, weights=weights, k=1)[0]
                 backend = self._backends[idx]
                 provider, key, profile = backend
                 return provider, key, profile.model, profile.provider_config, idx  # type: ignore[union-attr]
 
-            # All backends unhealthy — return a random one anyway
-            logger.warning("All %d backends unhealthy, attempting request anyway", n)
-            idx = random.randint(0, n - 1)
+            # All backends unhealthy — choose the least recently failed backend
+            # so we recover the oldest failure first instead of pure random.
+            if require_streaming:
+                logger.warning("All %d backends unhealthy or non-stream-capable, attempting request anyway", n)
+            else:
+                logger.warning("All %d backends unhealthy, attempting request anyway", n)
+            candidates = []
+            for idx in range(n):
+                provider = self._backends[idx][0]
+                if require_streaming and type(provider).stream_request is ProviderAdapter.stream_request:
+                    continue
+                if require_streaming and not provider.use_custom_transport:
+                    continue
+                health = self._backend_health[idx]
+                failed_at = health["failed_at"]
+                if failed_at is None:
+                    candidates.append((0.0, idx))
+                else:
+                    candidates.append((failed_at, idx))
+            if candidates:
+                _failed_at, idx = min(candidates, key=lambda item: item[0])
+            else:
+                idx = random.randint(0, n - 1)
             backend = self._backends[idx]
             provider, key, profile = backend
             return provider, key, profile.model, profile.provider_config, idx  # type: ignore[union-attr]
 
         return self._provider, self._resolved_key, self._model, self._provider_config or {}, -1
 
-    def _mark_backend_unhealthy(self, index: int, *, cooldown: int | None = None) -> None:
-        """Mark a backend as unhealthy and log the event."""
+    def _mark_backend_unhealthy(self, index: int, *, cooldown: int | None = None, failure_kind: str = "hard") -> None:
+        """Mark a backend as unhealthy and log the event.
+
+        failure_kind: "hard" (default), "stream", "transport", "rate_limit", or "cloudflare".
+        - "hard" resets stream_error_count and transport_error_count.
+        - "stream" increments stream_error_count, resets transport_error_count.
+        - "transport" increments transport_error_count, resets stream_error_count.
+        - "rate_limit" marks the backend unhealthy and triggers family cooldown.
+        - "cloudflare" marks the backend unhealthy and triggers escalated family cooldown.
+
+        For backward compatibility, a short cooldown passed without an explicit
+        failure_kind is treated as a stream error.
+        """
         if not self._backends or index >= len(self._backend_health):
             return
         health = self._backend_health[index]
         health["healthy"] = False
         health["failed_at"] = time.monotonic()
+        health["failure_count"] = health.get("failure_count", 0) + 1
 
         if cooldown is not None:
             health["cooldown"] = cooldown
-            # If this is a stream error, increment the error count
-            if cooldown < self._backend_cooldown:
-                health["stream_error_count"] = health.get("stream_error_count", 0) + 1
         else:
             health["cooldown"] = self._backend_cooldown
-            health["stream_error_count"] = 0  # Reset on persistent error
+
+        if failure_kind == "transport":
+            health["transport_error_count"] = health.get("transport_error_count", 0) + 1
+            health["stream_error_count"] = 0
+        elif failure_kind == "stream" or (cooldown is not None and cooldown <= self._backend_cooldown):
+            health["stream_error_count"] = health.get("stream_error_count", 0) + 1
+            health["transport_error_count"] = 0
+        else:
+            health["stream_error_count"] = 0
+            health["transport_error_count"] = 0
+
+        # Family-level anti-abuse cooldown for rate-limit / Cloudflare failures
+        if failure_kind in ("rate_limit", "cloudflare"):
+            family = self._get_backend_family(index)
+            if family is not None:
+                self._mark_family_abuse(family, kind=failure_kind)
 
         profile_name = self._backends[index][2].name
         cooldown_val = health["cooldown"]
         logger.info(
-            "Backend %s marked unhealthy for %ds after upstream error",
+            "Backend %s marked unhealthy for %ds after %s error",
             profile_name,
             cooldown_val,
+            failure_kind,
         )
 
-    def _any_healthy_backend(self) -> bool:
+    def _any_healthy_backend(self, *, require_streaming: bool = False) -> bool:
         """Check if there's at least one healthy backend remaining."""
         if not self._backends:
             return False
-        for _idx, health in enumerate(self._backend_health):
+        for idx, health in enumerate(self._backend_health):
+            provider = self._backends[idx][0]
+            if require_streaming and type(provider).stream_request is ProviderAdapter.stream_request:
+                continue
+            if require_streaming and not provider.use_custom_transport:
+                continue
             if health["healthy"]:
                 return True
             # Check if cooldown has expired
@@ -281,6 +366,90 @@ class BridgeServer:
             return 30
         count = health.get("stream_error_count", 0)
         return min(30 * (2**count), self._backend_cooldown)
+
+    def _get_transport_error_cooldown(self, backend_idx: int) -> int:
+        """Return cooldown for a transport/connection-reset failure.
+
+        Uses the configured backend_cooldown as base and escalates by 50%
+        for each consecutive transport failure, capped at 2x the base.
+        """
+        if not self._backends or backend_idx < 0:
+            return self._backend_cooldown
+        health = self._backend_health[backend_idx]
+        count = health.get("transport_error_count", 0)
+        base = self._backend_cooldown
+        cooldown = int(base * (1.5 ** count))
+        return min(cooldown, base * 2)
+
+    def _get_backend_family(self, backend_idx: int) -> str | None:
+        """Return the provider family identifier for a backend (its provider_type)."""
+        if not self._backends or backend_idx < 0 or backend_idx >= len(self._backends):
+            return None
+        return self._backends[backend_idx][0].provider_type
+
+    def _get_family_cooldown(self, family: str) -> int | None:
+        """Return the cooldown value for a family, or None if not in cooldown.
+
+        Returns the remaining cooldown seconds if the family is actively in cooldown,
+        or None if no cooldown is active or it has expired.
+        """
+        entry = self._family_cooldown.get(family)
+        if entry is None:
+            return None
+        elapsed = time.monotonic() - entry["failed_at"]
+        if elapsed >= entry["cooldown"]:
+            return None
+        return entry["cooldown"]
+
+    def _mark_family_abuse(self, family: str, *, kind: str = "rate_limit") -> None:
+        """Mark a provider family as being in anti-abuse cooldown.
+
+        kind: "rate_limit" (429) or "cloudflare" (403 Cloudflare block).
+        Cloudflare blocks escalate the cooldown more aggressively.
+        """
+        entry = self._family_cooldown.get(family)
+        base = self._backend_cooldown
+
+        if entry is not None:
+            elapsed = time.monotonic() - entry["failed_at"]
+            if elapsed < entry["cooldown"]:
+                # Still active — escalate
+                entry["abuse_count"] = entry.get("abuse_count", 0) + 1
+            else:
+                # Expired — reset
+                entry["abuse_count"] = 1
+        else:
+            entry = {"abuse_count": 1}
+            self._family_cooldown[family] = entry
+
+        entry["failed_at"] = time.monotonic()
+        count = entry["abuse_count"]
+
+        if kind == "cloudflare":
+            # Cloudflare 403: stronger escalation — 1.5x base per count
+            entry["cooldown"] = min(int(base * (1.5 ** count)), base * 3)
+        else:
+            # Rate limit 429: moderate escalation — base * count, capped at 2x
+            entry["cooldown"] = min(base * count, base * 2)
+
+        logger.info(
+            "Family %s cooldown set to %ds after %s (abuse_count=%d)",
+            family,
+            entry["cooldown"],
+            kind,
+            count,
+        )
+
+    def _is_family_in_cooldown(self, backend_idx: int) -> bool:
+        """Return True if the backend's provider family is currently in cooldown."""
+        family = self._get_backend_family(backend_idx)
+        if family is None:
+            return False
+        entry = self._family_cooldown.get(family)
+        if entry is None:
+            return False
+        elapsed = time.monotonic() - entry["failed_at"]
+        return elapsed < entry["cooldown"]
 
     @staticmethod
     def _is_upstream_stream_error(chunk: dict) -> bool:
@@ -322,9 +491,15 @@ class BridgeServer:
             return choices[0].get("finish_reason") is not None
         return False
 
-    def _select_backend(self) -> None:
-        """Select next backend and set active fields for the current request."""
-        provider, key, model, provider_config, backend_idx = self._get_next_backend()
+    def _select_backend(self, *, require_streaming: bool = False) -> None:
+        """Select next backend and set active fields for the current request.
+
+        When require_streaming is True, only selects backends whose provider
+        overrides stream_request() from the base ProviderAdapter.
+        """
+        provider, key, model, provider_config, backend_idx = self._get_next_backend(
+            require_streaming=require_streaming,
+        )
         self._active_provider = provider
         self._active_key = key
         self._active_model = model
@@ -715,9 +890,10 @@ class BridgeServer:
                 except Exception as exc:
                     logger.warning("Custom-transport stream failed: %s", exc)
                     if self._backends and self._current_backend_idx >= 0:
-                        self._mark_backend_unhealthy(self._current_backend_idx)
+                        cooldown = self._get_stream_error_cooldown(self._current_backend_idx)
+                        self._mark_backend_unhealthy(self._current_backend_idx, cooldown=cooldown)
                         if self._any_healthy_backend() and attempt < n_backends - 1:
-                            self._select_backend()
+                            self._select_backend(require_streaming=True)
                             self._normalize_model(cc_request)
                             self._active_provider.normalize_request(cc_request)
                             cc_request["_resolved_key"] = self._active_key
@@ -1143,9 +1319,20 @@ class BridgeServer:
                     logger.warning("Custom-transport stream failed: %s", exc)
                     # In balancing mode: mark unhealthy and failover
                     if self._backends and self._current_backend_idx >= 0:
-                        self._mark_backend_unhealthy(self._current_backend_idx)
+                        is_transport = _is_transport_error(exc)
+                        cooldown = (
+                            self._get_transport_error_cooldown(self._current_backend_idx)
+                            if is_transport
+                            else self._backend_cooldown
+                        )
+                        kind = "transport" if is_transport else "hard"
+                        self._mark_backend_unhealthy(
+                            self._current_backend_idx,
+                            cooldown=cooldown,
+                            failure_kind=kind,
+                        )
                         if self._any_healthy_backend() and attempt < max_attempts - 1:
-                            self._select_backend()
+                            self._select_backend(require_streaming=True)
                             self._normalize_model(cc_request)
                             self._active_provider.normalize_request(cc_request)
                             cc_request["_resolved_key"] = self._active_key
@@ -1505,7 +1692,18 @@ class BridgeServer:
                         if attempt < max_attempts - 1:
                             # In balancing mode: mark unhealthy, try next backend
                             if self._backends and self._current_backend_idx >= 0:
-                                self._mark_backend_unhealthy(self._current_backend_idx)
+                                is_transport = _is_transport_error(exc)
+                                cooldown = (
+                                    self._get_transport_error_cooldown(self._current_backend_idx)
+                                    if is_transport
+                                    else self._backend_cooldown
+                                )
+                                kind = "transport" if is_transport else "hard"
+                                self._mark_backend_unhealthy(
+                                    self._current_backend_idx,
+                                    cooldown=cooldown,
+                                    failure_kind=kind,
+                                )
                                 if self._any_healthy_backend():
                                     self._select_backend()
                                     self._normalize_model(cc_request)
@@ -1684,9 +1882,10 @@ class BridgeServer:
                 except Exception as exc:
                     logger.warning("Custom-transport stream failed: %s", exc)
                     if self._backends and self._current_backend_idx >= 0:
-                        self._mark_backend_unhealthy(self._current_backend_idx)
+                        cooldown = self._get_stream_error_cooldown(self._current_backend_idx)
+                        self._mark_backend_unhealthy(self._current_backend_idx, cooldown=cooldown)
                         if self._any_healthy_backend() and attempt < n_backends - 1:
-                            self._select_backend()
+                            self._select_backend(require_streaming=True)
                             self._normalize_model(cc_request)
                             self._active_provider.normalize_request(cc_request)
                             cc_request["_resolved_key"] = self._active_key
@@ -1992,7 +2191,7 @@ class BridgeServer:
                 self._active_provider.normalize_request(cc_request)
 
             try:
-                cc_response = await self._make_upstream_request(cc_request)
+                cc_response = await self._make_upstream_request(cc_request, retry_rate_limit=False)
                 if not self._is_empty_cc_response(cc_response):
                     return cc_response
                 # Empty response — mark backend unhealthy and try next
@@ -2009,7 +2208,8 @@ class BridgeServer:
                 last_exc = exc
                 idx = self._current_backend_idx
                 if idx >= 0:
-                    self._mark_backend_unhealthy(idx)
+                    failure_kind = "rate_limit" if exc.status == 429 else "hard"
+                    self._mark_backend_unhealthy(idx, failure_kind=failure_kind)
                 logger.info(
                     "Backend attempt %d/%d failed (status %d), retrying",
                     attempt + 1,
@@ -2123,9 +2323,10 @@ class BridgeServer:
                 except Exception as exc:
                     logger.warning("Custom-transport stream failed: %s", exc)
                     if self._backends and self._current_backend_idx >= 0:
-                        self._mark_backend_unhealthy(self._current_backend_idx)
+                        cooldown = self._get_stream_error_cooldown(self._current_backend_idx)
+                        self._mark_backend_unhealthy(self._current_backend_idx, cooldown=cooldown)
                         if self._any_healthy_backend() and attempt < n_backends - 1:
-                            self._select_backend()
+                            self._select_backend(require_streaming=True)
                             self._normalize_model(cc_request)
                             self._active_provider.normalize_request(cc_request)
                             cc_request["_resolved_key"] = self._active_key
@@ -2815,12 +3016,17 @@ class BridgeServer:
             return provider.build_upstream_headers_for_model(self._active_key, model)
         return provider.build_upstream_headers(self._active_key)
 
-    async def _make_upstream_request(self, cc_request: dict) -> dict:
+    async def _make_upstream_request(self, cc_request: dict, *, retry_rate_limit: bool = True) -> dict:
         """Send a non-streaming request upstream.
 
         For providers with ``use_custom_transport=True``, delegates to the
         provider's ``make_request()`` method (e.g. boto3 for Bedrock).
         Otherwise uses aiohttp with retry/backoff.
+
+        Args:
+            cc_request: The request payload in CC format.
+            retry_rate_limit: When False, 429 is not retried on this backend
+                (the caller handles failover instead).
 
         Returns the upstream response dict (in CC format) on success.
         Raises UpstreamError(status, body) on non-retryable or exhausted failures.
@@ -2849,6 +3055,11 @@ class BridgeServer:
 
                 if last_status < 400:
                     return self._active_provider.translate_from_upstream(last_body)
+
+                # In balancing mode (retry_rate_limit=False), raise 429 immediately
+                # so the caller can fail over to another backend.
+                if last_status == 429 and not retry_rate_limit:
+                    raise UpstreamError(last_status, last_body)
 
                 if last_status in _RETRYABLE_STATUSES and attempt < _MAX_RETRIES:
                     delay = _BACKOFF_BASE * (2**attempt)
