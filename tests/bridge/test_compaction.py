@@ -6,7 +6,7 @@ histories to prevent 400 "context too large" errors from upstream providers.
 
 import json
 
-from kitty.bridge.server import BridgeServer
+from kitty.bridge.server import _COMPACTION_GUARANTEED_MESSAGES_MAX, BridgeServer
 from kitty.launchers.base import LauncherAdapter, SpawnConfig
 from kitty.profiles.schema import Profile
 from kitty.providers.base import ProviderAdapter
@@ -438,3 +438,133 @@ class TestCompactMessagesEdgeCases:
 
         # Check no message appears twice (by identity)
         assert len(result) == len({id(m) for m in result})
+
+
+class TestCompactMessagesGuaranteedFit:
+    """Compaction must guarantee the serialized messages fit under _COMPACTION_GUARANTEED_MESSAGES_MAX.
+
+    After head+tail pruning, if the result is still too large, the method must
+    iteratively drop oldest blocks (head first, then tail front) until it fits.
+    System messages and at least one tail block must always be preserved.
+    """
+
+    def test_guaranteed_fit_reduces_oversized_result(self):
+        """Even enormous messages must be reduced below the guaranteed max."""
+        server = _make_server()
+        # Build messages where each block is huge, so head+tail pruning still
+        # leaves a result above the guaranteed budget.
+        messages = [{"role": "system", "content": "System prompt"}]
+        for i in range(30):
+            role = "user" if i % 2 == 0 else "assistant"
+            # Each message ~200K chars; 30 of them = ~6M total
+            messages.append({"role": role, "content": f"Message {i} " * 50_000})
+
+        original_size = _char_size(messages)
+        assert original_size > _COMPACTION_GUARANTEED_MESSAGES_MAX
+
+        result = server._compact_messages(messages.copy())
+        result_size = _char_size(result)
+
+        assert result_size <= _COMPACTION_GUARANTEED_MESSAGES_MAX, (
+            f"Compacted size {result_size} exceeds guaranteed max {_COMPACTION_GUARANTEED_MESSAGES_MAX}"
+        )
+
+    def test_guaranteed_fit_drops_head_before_tail(self):
+        """When shrinking, oldest head blocks are dropped before any tail blocks."""
+        server = _make_server()
+        # Small system, distinct head messages, distinct tail messages
+        messages = [
+            {"role": "system", "content": "System"},
+            {"role": "user", "content": "HEAD_FIRST " * 100_000},  # ~1.2M
+            {"role": "assistant", "content": "HEAD_SECOND " * 100_000},  # ~1.3M
+            {"role": "user", "content": "MIDDLE " * 100_000},  # ~0.7M
+            {"role": "assistant", "content": "TAIL_SECOND " * 100_000},  # ~1.3M
+            {"role": "user", "content": "TAIL_FIRST " * 100_000},  # ~1.2M
+        ]
+
+        result = server._compact_messages(messages.copy())
+        result_text = json.dumps(result, ensure_ascii=False)
+
+        # System must survive
+        assert result[0]["role"] == "system"
+
+        # Most recent tail content must survive (it's most valuable)
+        assert "TAIL_FIRST" in result_text
+
+        # Head content should be dropped to make room
+        assert "HEAD_FIRST" not in result_text
+
+    def test_guaranteed_fit_trims_tail_keeping_latest(self):
+        """When head is fully dropped, tail is trimmed from oldest but latest block survives."""
+        server = _make_server()
+        # No head — only system + many huge tail blocks
+        messages = [{"role": "system", "content": "S" * 100_000}]  # ~100K system
+        for i in range(25):
+            role = "user" if i % 2 == 0 else "assistant"
+            messages.append({"role": role, "content": f"Block_{i:02d}_" * 50_000})  # ~350K each
+
+        result = server._compact_messages(messages.copy())
+        result_text = json.dumps(result, ensure_ascii=False)
+
+        # System survives
+        assert result[0]["role"] == "system"
+        assert len(result[0]["content"]) == 100_000
+
+        # Latest block (Block_24) must survive
+        assert "Block_24" in result_text
+
+        # Result must be under guaranteed max
+        assert _char_size(result) <= _COMPACTION_GUARANTEED_MESSAGES_MAX
+
+    def test_guaranteed_fit_preserves_system_message(self):
+        """System message must survive aggressive shrinking even when very large."""
+        server = _make_server()
+        huge_system = "SYS" * 500_000  # ~1.5M chars
+        messages = [{"role": "system", "content": huge_system}]
+        for i in range(15):
+            role = "user" if i % 2 == 0 else "assistant"
+            messages.append({"role": role, "content": f"Msg{i} " * 50_000})
+
+        result = server._compact_messages(messages.copy())
+
+        # System message must be first and unchanged
+        assert result[0]["role"] == "system"
+        assert result[0]["content"] == huge_system
+
+    def test_guaranteed_fit_preserves_atomic_blocks(self):
+        """Tool-call/result pairs must not be split during fallback shrinking."""
+        server = _make_server()
+        messages = [
+            {"role": "system", "content": "System"},
+            {"role": "user", "content": "Do task"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {"id": "call_1", "type": "function", "function": {"name": "read", "arguments": "{}"}}
+                ],
+            },
+            {"role": "tool", "content": "T" * 200_000, "tool_call_id": "call_1"},
+            {"role": "assistant", "content": "A" * 200_000},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {"id": "call_2", "type": "function", "function": {"name": "write", "arguments": "{}"}}
+                ],
+            },
+            {"role": "tool", "content": "R" * 200_000, "tool_call_id": "call_2"},
+            {"role": "assistant", "content": "Final answer"},
+        ]
+
+        result = server._compact_messages(messages.copy())
+
+        # If a tool_call_id appears, its assistant tool_call must be adjacent
+        tool_results = [(i, m) for i, m in enumerate(result) if m.get("role") == "tool"]
+        for idx, tr in tool_results:
+            assert idx > 0, f"Tool result at index {idx} has no preceding assistant"
+            prev = result[idx - 1]
+            assert prev["role"] == "assistant"
+            assert prev.get("tool_calls") is not None
+            call_ids = {tc["id"] for tc in prev["tool_calls"]}
+            assert tr["tool_call_id"] in call_ids
