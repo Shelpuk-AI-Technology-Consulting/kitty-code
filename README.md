@@ -10,7 +10,7 @@ Use your favorite coding agent with any LLM provider.
 > **Claude Code with MiniMax. Codex with GLM. Gemini CLI with OpenRouter. One command.**
 
 <p align="left">
-  <img src="assets/logo.png" alt="Kitty Bridge" width="800">
+  <img src="https://raw.githubusercontent.com/Shelpuk-AI-Technology-Consulting/kitty-code/main/assets/logo.png" alt="Kitty Bridge" width="800">
 </p>
 
 ## Why Kitty Bridge?
