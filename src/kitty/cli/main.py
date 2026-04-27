@@ -104,7 +104,13 @@ def main() -> None:
     cred_store = CredentialStore(backends=[FileBackend()])
     router = CLIRouter(profile_store, adapters)
 
-    result = router.route(all_command_args)
+    from kitty.cli.router import RoutingError
+
+    try:
+        result = router.route(all_command_args)
+    except RoutingError:
+        _print_unknown_command(all_command_args, adapters, profile_store)
+        sys.exit(1)
 
     if result.builtin == BuiltinCommand.SETUP:
         _run_setup(profile_store, cred_store)
@@ -282,6 +288,30 @@ def _run_auth(profile_store: object, cred_store: object, extra_args: list[str]) 
         asyncio.run(run_auth_openai(profile_store, cred_store))  # type: ignore[arg-type]
     else:
         print(f"Unknown auth provider: {args[0]!r}")
+
+
+def _print_unknown_command(args: list[str], adapters: dict, store: object) -> None:
+    """Print a friendly error message for unrecognized commands."""
+    from kitty.tui.display import print_error
+
+    cmd = args[0] if args else ""
+    print_error(f"Unknown command or profile: {cmd!r}")
+
+    print()
+    print("Available commands:")
+    for c in ("setup", "profile", "doctor", "cleanup", "bridge"):
+        print(f"  kitty {c}")
+    print()
+    print("Available agents:")
+    for name in sorted(adapters):
+        print(f"  kitty {name}")
+    print()
+    backends = store.get_all_backends()
+    if backends:
+        print("Your profiles:")
+        for b in backends:
+            print(f"  kitty {b.name} <agent>")
+        print()
 
 
 def _run_setup(profile_store: object, cred_store: object) -> None:

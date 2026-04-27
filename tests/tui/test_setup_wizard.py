@@ -12,6 +12,7 @@ from kitty.auth.oauth_session import OAuthSession
 from kitty.cli.setup_cmd import run_setup_wizard
 from kitty.credentials.file_backend import FileBackend
 from kitty.credentials.store import CredentialStore
+from kitty.profiles.schema import PROVIDER_LABELS
 from kitty.profiles.store import ProfileStore
 
 # Patch targets for setup_cmd (it imports directly)
@@ -45,7 +46,7 @@ class TestRunSetupWizard:
         """Wizard completes all steps and returns a saved Profile."""
         with (
             _mock_tty(),
-            patch(f"{_MOD}.SelectionMenu.show", return_value="zai_regular"),
+            patch(f"{_MOD}.SelectionMenu.show", return_value=PROVIDER_LABELS["zai_regular"]),
             patch(f"{_MOD}._find_reusable_auth_ref", return_value=None),
             patch(f"{_MOD}.prompt_secret", return_value="sk-test-api-key-12345"),
             patch(f"{_MOD}.prompt_text", side_effect=["gpt-4o", "myprofile"]),
@@ -72,7 +73,7 @@ class TestRunSetupWizard:
         """When user enters empty profile name, defaults to provider name."""
         with (
             _mock_tty(),
-            patch(f"{_MOD}.SelectionMenu.show", return_value="novita"),
+            patch(f"{_MOD}.SelectionMenu.show", return_value=PROVIDER_LABELS["novita"]),
             patch(f"{_MOD}._find_reusable_auth_ref", return_value=None),
             patch(f"{_MOD}.prompt_secret", return_value="sk-key"),
             patch(f"{_MOD}.prompt_text", side_effect=["model-x", ""]),
@@ -88,7 +89,7 @@ class TestRunSetupWizard:
         """Wizard rejects reserved names and retries."""
         with (
             _mock_tty(),
-            patch(f"{_MOD}.SelectionMenu.show", return_value="zai_regular"),
+            patch(f"{_MOD}.SelectionMenu.show", return_value=PROVIDER_LABELS["zai_regular"]),
             patch(f"{_MOD}._find_reusable_auth_ref", return_value=None),
             patch(f"{_MOD}.prompt_secret", return_value="sk-key"),
             patch(f"{_MOD}.prompt_text", side_effect=["gpt-4o", "setup", "goodname"]),
@@ -103,7 +104,7 @@ class TestRunSetupWizard:
         """Wizard rejects invalid name format and retries."""
         with (
             _mock_tty(),
-            patch(f"{_MOD}.SelectionMenu.show", return_value="zai_regular"),
+            patch(f"{_MOD}.SelectionMenu.show", return_value=PROVIDER_LABELS["zai_regular"]),
             patch(f"{_MOD}._find_reusable_auth_ref", return_value=None),
             patch(f"{_MOD}.prompt_secret", return_value="sk-key"),
             patch(f"{_MOD}.prompt_text", side_effect=["gpt-4o", "BAD NAME!", "valid-name"]),
@@ -118,7 +119,7 @@ class TestRunSetupWizard:
         """Connectivity check failure warns but allows proceeding."""
         with (
             _mock_tty(),
-            patch(f"{_MOD}.SelectionMenu.show", return_value="zai_regular"),
+            patch(f"{_MOD}.SelectionMenu.show", return_value=PROVIDER_LABELS["zai_regular"]),
             patch(f"{_MOD}._find_reusable_auth_ref", return_value=None),
             patch(f"{_MOD}.prompt_secret", return_value="sk-key"),
             patch(f"{_MOD}.prompt_text", side_effect=["gpt-4o", "test"]),
@@ -135,7 +136,7 @@ class TestRunSetupWizard:
         """Connectivity check success prints status."""
         with (
             _mock_tty(),
-            patch(f"{_MOD}.SelectionMenu.show", return_value="zai_regular"),
+            patch(f"{_MOD}.SelectionMenu.show", return_value=PROVIDER_LABELS["zai_regular"]),
             patch(f"{_MOD}._find_reusable_auth_ref", return_value=None),
             patch(f"{_MOD}.prompt_secret", return_value="sk-key"),
             patch(f"{_MOD}.prompt_text", side_effect=["gpt-4o", "test"]),
@@ -155,7 +156,7 @@ class TestRunSetupWizard:
 
         with (
             _mock_tty(),
-            patch(f"{_MOD}.SelectionMenu.show", return_value="minimax"),
+            patch(f"{_MOD}.SelectionMenu.show", return_value=PROVIDER_LABELS["minimax"]),
             patch(f"{_MOD}._find_reusable_auth_ref", return_value=existing_ref),
             patch(f"{_MOD}.prompt_confirm", side_effect=[True, True, False]),  # reuse=True, default=True, no conn.check
             patch(f"{_MOD}.prompt_secret") as mock_secret,
@@ -213,7 +214,7 @@ class TestSetupWizardOAuth:
 
         with (
             _mock_tty(),
-            patch(f"{_MOD}.SelectionMenu.show", return_value="OpenAI ChatGPT (subscription)"),
+            patch(f"{_MOD}.SelectionMenu.show", return_value=PROVIDER_LABELS["openai_subscription"]),
             patch("kitty.cli.auth_cmd.run_oauth_for_provider", _mock_run_oauth_for_provider(session)),
             patch(f"{_MOD}.prompt_text", side_effect=["gpt-5.3-codex", "my-openai"]),
             patch(f"{_MOD}.prompt_confirm", side_effect=[False]),  # set_default, no conn check
@@ -232,7 +233,7 @@ class TestSetupWizardOAuth:
 
         with (
             _mock_tty(),
-            patch(f"{_MOD}.SelectionMenu.show", return_value="OpenAI ChatGPT (subscription)"),
+            patch(f"{_MOD}.SelectionMenu.show", return_value=PROVIDER_LABELS["openai_subscription"]),
             patch("kitty.cli.auth_cmd.run_oauth_for_provider", _mock_run_oauth_for_provider(session)),
             patch(f"{_MOD}.prompt_text", side_effect=["", "openai-prof"]),
             patch(f"{_MOD}.prompt_confirm", side_effect=[False]),

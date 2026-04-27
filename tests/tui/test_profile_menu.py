@@ -11,7 +11,7 @@ import pytest
 from kitty.auth.oauth_session import OAuthSession
 from kitty.credentials.file_backend import FileBackend
 from kitty.credentials.store import CredentialStore
-from kitty.profiles.schema import BalancingProfile, Profile
+from kitty.profiles.schema import PROVIDER_LABELS, BalancingProfile, Profile
 from kitty.profiles.store import ProfileStore
 
 # ---------------------------------------------------------------------------
@@ -135,7 +135,7 @@ class TestCreateProfileFlow:
         """T12: No same-provider profile → fresh key prompt, profile saved."""
         create = _import_create_profile_flow()
         with (
-            patch("kitty.cli.profile_cmd.SelectionMenu.show", return_value="zai_regular"),
+            patch("kitty.cli.profile_cmd.SelectionMenu.show", return_value=PROVIDER_LABELS["zai_regular"]),
             patch("kitty.cli.profile_cmd._find_reusable_auth_ref", return_value=None),
             patch("kitty.cli.profile_cmd.prompt_secret", return_value="sk-test-key"),
             patch("kitty.cli.profile_cmd.prompt_text", side_effect=["gpt-4o", "myprofile"]),
@@ -158,7 +158,7 @@ class TestCreateProfileFlow:
         cred_store.set(existing.auth_ref, "existing-key")
 
         with (
-            patch("kitty.cli.profile_cmd.SelectionMenu.show", return_value="zai_regular"),
+            patch("kitty.cli.profile_cmd.SelectionMenu.show", return_value=PROVIDER_LABELS["zai_regular"]),
             patch("kitty.cli.profile_cmd._find_reusable_auth_ref", return_value=existing.auth_ref),
             patch("kitty.cli.profile_cmd.prompt_confirm", side_effect=[True, True]),  # reuse=True, default=True
             patch("kitty.cli.profile_cmd.prompt_secret") as mock_secret,
@@ -177,7 +177,7 @@ class TestCreateProfileFlow:
         cred_store.set(existing.auth_ref, "old-key")
 
         with (
-            patch("kitty.cli.profile_cmd.SelectionMenu.show", return_value="zai_regular"),
+            patch("kitty.cli.profile_cmd.SelectionMenu.show", return_value=PROVIDER_LABELS["zai_regular"]),
             patch("kitty.cli.profile_cmd._find_reusable_auth_ref", return_value=existing.auth_ref),
             patch("kitty.cli.profile_cmd.prompt_confirm", side_effect=[False, True]),  # reuse=False, default=True
             patch("kitty.cli.profile_cmd.prompt_secret", return_value="new-key"),
@@ -404,7 +404,7 @@ class TestDuplicateNameGuard:
         store.save(_make_profile("taken"))
 
         with (
-            patch("kitty.cli.profile_cmd.SelectionMenu.show", return_value="zai_regular"),
+            patch("kitty.cli.profile_cmd.SelectionMenu.show", return_value=PROVIDER_LABELS["zai_regular"]),
             patch("kitty.cli.profile_cmd._find_reusable_auth_ref", return_value=None),
             patch("kitty.cli.profile_cmd.prompt_secret", return_value="sk-key"),
             # first name attempt "taken" → duplicate; second attempt "fresh" → ok
@@ -691,7 +691,7 @@ class TestCreateProfileFlowOAuth:
         session = _make_oauth_session()
 
         with (
-            patch("kitty.cli.profile_cmd.SelectionMenu.show", return_value="OpenAI ChatGPT (subscription)"),
+            patch("kitty.cli.profile_cmd.SelectionMenu.show", return_value=PROVIDER_LABELS["openai_subscription"]),
             patch("kitty.cli.auth_cmd.run_oauth_for_provider", _mock_run_oauth_for_provider(session)),
             patch("kitty.cli.profile_cmd.prompt_text", side_effect=["gpt-5.3-codex", "my-oauth-profile"]),
             patch("kitty.cli.profile_cmd.prompt_confirm", return_value=True),
@@ -710,7 +710,7 @@ class TestCreateProfileFlowOAuth:
         session = _make_oauth_session()
 
         with (
-            patch("kitty.cli.profile_cmd.SelectionMenu.show", return_value="OpenAI ChatGPT (subscription)"),
+            patch("kitty.cli.profile_cmd.SelectionMenu.show", return_value=PROVIDER_LABELS["openai_subscription"]),
             patch("kitty.cli.auth_cmd.run_oauth_for_provider", _mock_run_oauth_for_provider(session)),
             patch("kitty.cli.profile_cmd.prompt_text", side_effect=["", "oauth-profile"]),
             patch("kitty.cli.profile_cmd.prompt_confirm", return_value=True),
@@ -727,7 +727,7 @@ class TestCreateProfileFlowOAuth:
         session = _make_oauth_session()
 
         with (
-            patch("kitty.cli.profile_cmd.SelectionMenu.show", return_value="OpenAI ChatGPT (subscription)"),
+            patch("kitty.cli.profile_cmd.SelectionMenu.show", return_value=PROVIDER_LABELS["openai_subscription"]),
             patch("kitty.cli.auth_cmd.run_oauth_for_provider", _mock_run_oauth_for_provider(session)),
             patch("kitty.cli.profile_cmd.prompt_text", side_effect=["gpt-5.3-codex", "oauth-prof"]),
             patch("kitty.cli.profile_cmd.prompt_confirm", return_value=True),
@@ -795,7 +795,7 @@ class TestCreateProfileFlowCustomURL:
         """Custom URL provider prompts for base URL, stores it in provider_config."""
         create = _import_create_profile_flow()
         with (
-            patch("kitty.cli.profile_cmd.SelectionMenu.show", return_value="custom_openai"),
+            patch("kitty.cli.profile_cmd.SelectionMenu.show", return_value=PROVIDER_LABELS["custom_openai"]),
             patch("kitty.cli.profile_cmd._find_reusable_auth_ref", return_value=None),
             patch("kitty.cli.profile_cmd.prompt_text", side_effect=[
                 "https://api.deepseek.com/v1",  # base URL
@@ -817,7 +817,7 @@ class TestCreateProfileFlowCustomURL:
         """Empty base URL is rejected with error, user re-prompted."""
         create = _import_create_profile_flow()
         with (
-            patch("kitty.cli.profile_cmd.SelectionMenu.show", return_value="custom_openai"),
+            patch("kitty.cli.profile_cmd.SelectionMenu.show", return_value=PROVIDER_LABELS["custom_openai"]),
             patch("kitty.cli.profile_cmd._find_reusable_auth_ref", return_value=None),
             patch("kitty.cli.profile_cmd.prompt_text", side_effect=[
                 "",                                   # empty base URL → rejected
@@ -839,7 +839,7 @@ class TestCreateProfileFlowCustomURL:
         """HTTP base URL is accepted (e.g. local vLLM, unlike Profile.base_url which is HTTPS-only)."""
         create = _import_create_profile_flow()
         with (
-            patch("kitty.cli.profile_cmd.SelectionMenu.show", return_value="custom_openai"),
+            patch("kitty.cli.profile_cmd.SelectionMenu.show", return_value=PROVIDER_LABELS["custom_openai"]),
             patch("kitty.cli.profile_cmd._find_reusable_auth_ref", return_value=None),
             patch("kitty.cli.profile_cmd.prompt_text", side_effect=[
                 "http://localhost:8000/v1",  # HTTP base URL
@@ -859,7 +859,7 @@ class TestCreateProfileFlowCustomURL:
         """Regular provider (e.g. zai_regular) does NOT get prompted for base URL."""
         create = _import_create_profile_flow()
         with (
-            patch("kitty.cli.profile_cmd.SelectionMenu.show", return_value="zai_regular"),
+            patch("kitty.cli.profile_cmd.SelectionMenu.show", return_value=PROVIDER_LABELS["zai_regular"]),
             patch("kitty.cli.profile_cmd._find_reusable_auth_ref", return_value=None),
             patch("kitty.cli.profile_cmd.prompt_text", side_effect=["gpt-4o", "regular-profile"]) as mock_text,
             patch("kitty.cli.profile_cmd.prompt_secret", return_value="sk-key"),

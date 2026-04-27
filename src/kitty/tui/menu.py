@@ -68,12 +68,10 @@ class CheckboxMenu:
         if not sys.stdin.isatty():
             return None
 
-        choices: list[Any] = []
-        for opt in self._options:
-            if isinstance(opt, (questionary.Choice, questionary.Separator)):
-                choices.append(opt)
-            else:
-                choices.append(questionary.Choice(title=opt, value=opt, checked=opt in self._default_checked))
+        choices: list[Any] = [
+            questionary.Choice(title=opt, value=opt, checked=opt in self._default_checked)
+            for opt in self._options
+        ]
 
         kwargs: dict[str, Any] = {"choices": choices}
         if self._validate is not None:
