@@ -1,7 +1,9 @@
-[![PyPI version](https://img.shields.io/pypi/v/kitty-bridge.svg)](https://pypi.org/project/kitty-bridge/)
-[![Python version](https://img.shields.io/pypi/pyversions/kitty-bridge.svg)](https://pypi.org/project/kitty-bridge/)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/Shelpuk-AI-Technology-Consulting/kitty-code/blob/main/LICENSE)
-[![CI](https://img.shields.io/github/actions/workflow/status/Shelpuk-AI-Technology-Consulting/kitty-code/ci.yml?branch=main)](https://github.com/Shelpuk-AI-Technology-Consulting/kitty-code/actions)
+<p align="center">
+  <img src="https://img.shields.io/pypi/v/kitty-bridge.svg" alt="PyPI version">
+  <img src="https://img.shields.io/pypi/pyversions/kitty-bridge.svg" alt="Python version">
+  <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT">
+  <img src="https://img.shields.io/github/actions/workflow/status/Shelpuk-AI-Technology-Consulting/kitty-code/ci.yml?branch=main" alt="CI">
+</p>
 
 Use your favorite coding agent with any LLM provider.
 
