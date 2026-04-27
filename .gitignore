@@ -12,3 +12,4 @@
 *.whl
 *.tar.gz
 /.research/
+/CLAUDE.md

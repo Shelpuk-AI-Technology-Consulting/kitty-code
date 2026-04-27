@@ -41,12 +41,56 @@ _PROVIDER_TYPES = Literal[
 PROVIDER_LIST: list[str] = list(typing.get_args(_PROVIDER_TYPES))
 
 PROVIDER_LABELS: dict[str, str] = {
+    "anthropic": "Anthropic",
+    "azure": "MS Azure",
+    "bedrock": "AWS Bedrock",
+    "byteplus": "BytePlus",
+    "custom_openai": "Custom OpenAI-Compatible",
+    "fireworks": "Fireworks FirePass",
     "google_aistudio": "Google AI Studio",
     "kimi": "Kimi Code",
+    "minimax": "MiniMax",
     "mimo": "Xiaomi MiMo",
-    "openai_subscription": "OpenAI ChatGPT (subscription)",
-    "custom_openai": "Custom OpenAI-Compatible",
+    "novita": "Novita AI",
+    "ollama": "Ollama",
+    "opencode_go": "OpenCode Go",
+    "openai": "OpenAI",
+    "openai_subscription": "OpenAI ChatGPT Plan",
+    "openrouter": "OpenRouter",
+    "vertex": "Google Cloud Vertex",
+    "zai_coding": "Z.AI Coding Plan",
+    "zai_regular": "Z.AI",
 }
+
+PROVIDER_SECTIONS: list[tuple[str, list[str]]] = [
+    ("-- Regular API Key --", [
+        "bedrock",
+        "anthropic",
+        "byteplus",
+        "google_aistudio",
+        "vertex",
+        "azure",
+        "minimax",
+        "openai",
+        "openrouter",
+        "zai_regular",
+    ]),
+    ("-- Coding Plans / Subscriptions --", [
+        "fireworks",
+        "kimi",
+        "novita",
+        "openai_subscription",
+        "opencode_go",
+        "mimo",
+        "zai_coding",
+    ]),
+    ("-- Local LLMs --", [
+        "ollama",
+    ]),
+    ("-- Generic --", [
+        "custom_openai",
+    ]),
+]
 
 
 class HttpsUrl(_HttpUrl):

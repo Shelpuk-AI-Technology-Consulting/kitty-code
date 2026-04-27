@@ -18,7 +18,7 @@ class SelectionMenu:
     Returns None in non-interactive (non-TTY) environments or when cancelled.
     """
 
-    def __init__(self, title: str, options: list[str]) -> None:
+    def __init__(self, title: str, options: list[Any]) -> None:
         self._title = title
         self._options = options
 
@@ -68,10 +68,12 @@ class CheckboxMenu:
         if not sys.stdin.isatty():
             return None
 
-        choices: list[Any] = [
-            questionary.Choice(title=opt, value=opt, checked=opt in self._default_checked)
-            for opt in self._options
-        ]
+        choices: list[Any] = []
+        for opt in self._options:
+            if isinstance(opt, (questionary.Choice, questionary.Separator)):
+                choices.append(opt)
+            else:
+                choices.append(questionary.Choice(title=opt, value=opt, checked=opt in self._default_checked))
 
         kwargs: dict[str, Any] = {"choices": choices}
         if self._validate is not None:

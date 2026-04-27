@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import uuid
 
+import questionary
+
 from kitty.credentials.store import CredentialStore
-from kitty.profiles.schema import _NAME_PATTERN, PROVIDER_LABELS, PROVIDER_LIST, RESERVED_NAMES, Profile
+from kitty.profiles.schema import _NAME_PATTERN, PROVIDER_LABELS, PROVIDER_SECTIONS, RESERVED_NAMES, Profile
 from kitty.profiles.store import ProfileStore
 from kitty.tui.display import print_error, print_section, print_status, print_step, print_warning, status_spinner
 from kitty.tui.menu import SelectionMenu
@@ -48,8 +50,18 @@ def run_setup_wizard(store: ProfileStore, cred_store: CredentialStore) -> Profil
 
     # Step 1: Provider selection
     print_step(1, 6, "Provider selection")
-    _label_to_type = {PROVIDER_LABELS.get(p, p): p for p in PROVIDER_LIST}
-    provider = SelectionMenu("Select provider", list(_label_to_type)).show()
+    choices: list = []
+    _label_to_type: dict[str, str] = {}
+    for header, providers in PROVIDER_SECTIONS:
+        choices.append(questionary.Separator(" "))
+        choices.append(questionary.Separator(header))
+        choices.append(questionary.Separator(" "))
+        for p in sorted(providers, key=lambda k: PROVIDER_LABELS.get(k, k)):
+            label = PROVIDER_LABELS.get(p, p)
+            choices.append(questionary.Choice(title=label, value=label))
+            _label_to_type[label] = p
+    choices.append(questionary.Separator(" "))
+    provider = SelectionMenu("Select provider", choices).show()
     if provider is not None:
         provider = _label_to_type[provider]
     if provider is None:
