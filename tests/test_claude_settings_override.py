@@ -7,6 +7,7 @@ so kitty must temporarily patch the file to inject the bridge URL and model.
 import json
 import uuid
 from pathlib import Path
+from unittest.mock import patch
 
 from kitty.launchers.claude import ClaudeAdapter
 from kitty.profiles.schema import Profile
@@ -200,3 +201,54 @@ class TestRoundTrip:
 
         # Verify restored
         assert settings_path.read_text(encoding="utf-8") == original_content
+
+
+class TestSettingsBackup:
+    """Tests for on-disk backup of Claude settings (crash recovery)."""
+
+    def test_prepare_launch_writes_backup(self, tmp_path: Path):
+        """prepare_launch must save original settings to a backup file."""
+        settings_path = tmp_path / ".claude" / "settings.json"
+        original_content = _write_settings(
+            settings_path,
+            env={"ANTHROPIC_AUTH_TOKEN": "my-real-token"},
+            model="opus",
+        )
+
+        adapter = ClaudeAdapter()
+        env_overrides = {
+            "ANTHROPIC_BASE_URL": "http://127.0.0.1:4242",
+            "ANTHROPIC_API_KEY": "sk-test",
+            "ANTHROPIC_AUTH_TOKEN": "kitty-bridge-token",
+        }
+
+        with patch("kitty.launchers.claude.save_settings_backup") as mock_save:
+            adapter.prepare_launch(env_overrides, settings_path=settings_path)
+            mock_save.assert_called_once_with(original_content)
+
+    def test_cleanup_launch_deletes_backup(self, tmp_path: Path):
+        """cleanup_launch must delete the backup file after restoring."""
+        settings_path = tmp_path / ".claude" / "settings.json"
+        original_content = _write_settings(
+            settings_path,
+            env={"ANTHROPIC_AUTH_TOKEN": "my-real-token"},
+        )
+
+        adapter = ClaudeAdapter()
+        with patch("kitty.launchers.claude.delete_settings_backup") as mock_delete:
+            adapter.cleanup_launch(original_content, settings_path=settings_path)
+            mock_delete.assert_called_once()
+
+    def test_prepare_launch_no_backup_when_no_settings(self, tmp_path: Path):
+        """No backup should be created when there is no settings.json."""
+        settings_path = tmp_path / ".claude" / "settings.json"
+
+        adapter = ClaudeAdapter()
+        with patch("kitty.launchers.claude.save_settings_backup") as mock_save:
+            result = adapter.prepare_launch(
+                {"ANTHROPIC_BASE_URL": "http://127.0.0.1:4242"},
+                settings_path=settings_path,
+            )
+
+        assert result is None
+        mock_save.assert_not_called()

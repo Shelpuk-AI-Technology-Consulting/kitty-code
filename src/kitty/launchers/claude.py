@@ -49,6 +49,31 @@ def _atomic_write_text(path: Path, content: str) -> None:
 
 __all__ = ["ClaudeAdapter"]
 
+_DEFAULT_BACKUP_PATH = Path.home() / ".config" / "kitty" / "claude-settings-backup.json"
+
+
+def save_settings_backup(original: str, backup_path: Path = _DEFAULT_BACKUP_PATH) -> None:
+    """Save the original settings.json content to a backup file for crash recovery."""
+    try:
+        backup_path.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write_text(backup_path, original)
+        logger.debug("save_settings_backup: wrote backup to %s", backup_path)
+    except OSError as exc:
+        logger.warning("save_settings_backup: failed to write backup: %s", exc)
+
+
+def load_settings_backup(backup_path: Path = _DEFAULT_BACKUP_PATH) -> str | None:
+    """Load the settings backup, returning None if it doesn't exist."""
+    if not backup_path.exists():
+        return None
+    return backup_path.read_text(encoding="utf-8")
+
+
+def delete_settings_backup(backup_path: Path = _DEFAULT_BACKUP_PATH) -> None:
+    """Delete the settings backup file."""
+    backup_path.unlink(missing_ok=True)
+
+
 _CONFLICTING_ENV_VARS: tuple[str, ...] = (
     "ANTHROPIC_BEDROCK_BASE_URL",
     "ANTHROPIC_VERTEX_BASE_URL",
@@ -153,6 +178,9 @@ class ClaudeAdapter(LauncherAdapter):
             logger.error("prepare_launch: settings.json root is not an object — skipping patch")
             return None
 
+        # Save backup for crash recovery before patching.
+        save_settings_backup(original)
+
         env = settings.setdefault("env", {})
 
         logger.info(
@@ -202,6 +230,7 @@ class ClaudeAdapter(LauncherAdapter):
         logger.info("cleanup_launch: restoring %s", settings_path)
         try:
             _atomic_write_text(settings_path, original)
+            delete_settings_backup()
         except Exception:
             logger.warning("cleanup_launch: failed to restore %s — user may need to fix manually", settings_path)
             raise
