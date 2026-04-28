@@ -33,6 +33,16 @@ Agent (Claude Code / Codex / Gemini / Kilo) → Kitty Bridge → any LLM provide
 
 Kitty sits between your coding agent and the upstream provider, translating each agent's native protocol in real time. Your agent keeps its workflow — you choose the model and the price.
 
+Kitty is also intentionally minimal:
+
+✅ **Local** — Kitty runs on your machine. It does not send your prompts, code, or files to any third-party service beyond the backend LLM provider you explicitly configure.
+
+✅ **Just a bridge** — Kitty only proxies and translates traffic between the coding agent and the backend model API. It does not get filesystem access, shell access, or any other extra capabilities.
+
+✅ **No AI inside Kitty** — Kitty does not use an LLM, embeddings, or any other AI system internally. It is a deterministic local bridge with advanced routing, balancing, and compatibility features.
+
+In short: Kitty is a **minimal, local, and safe bridge** with advanced functionality.
+
 If you like what we're building, please ⭐ **star this repo** – it's a huge motivation for us to keep going!
 
 ## Before You Start
