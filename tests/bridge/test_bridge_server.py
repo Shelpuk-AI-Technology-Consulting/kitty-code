@@ -719,3 +719,35 @@ class TestCloudflareDetection:
 
     def test_should_retry_stream_keeps_retryable_errors(self) -> None:
         assert BridgeServer._should_retry_stream(503, "service unavailable") is True
+
+
+class TestCloudflareRegression:
+    @pytest.mark.asyncio
+    async def test_non_streaming_cloudflare_403_returns_cloudflare_message(self):
+        """Non-streaming upstream Cloudflare HTML must surface the Cloudflare message, not auth error."""
+        adapter = StubLauncher(BridgeProtocol.RESPONSES_API)
+        provider = StubProvider()
+        server = BridgeServer(adapter, provider, "test-key")
+        port = await server.start_async()
+        try:
+            with aioresponses(passthrough=["http://127.0.0.1"]) as m:
+                m.post(
+                    "https://api.example.com/v1/chat/completions",
+                    status=403,
+                    body="<html>cf-browser-verification window._cf_chl_opt = {};</html>",
+                    headers={"Content-Type": "text/html"},
+                )
+                async with (
+                    aiohttp.ClientSession() as session,
+                    session.post(
+                        f"http://127.0.0.1:{port}/v1/responses",
+                        json=_make_responses_request(),
+                    ) as resp,
+                ):
+                    assert resp.status == 403
+                    data = await resp.json()
+                    message = data["error"]["message"].lower()
+                    assert "cloudflare bot detection" in message
+                    assert "api key is invalid" not in message
+        finally:
+            await server.stop_async()

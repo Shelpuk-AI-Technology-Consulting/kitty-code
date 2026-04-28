@@ -134,6 +134,110 @@ class TestRandomSelection:
         assert model is None
 
 
+class _MessagesLauncher(LauncherAdapter):
+    @property
+    def name(self) -> str:
+        return "stub"
+
+    @property
+    def binary_name(self) -> str:
+        return "stub"
+
+    @property
+    def bridge_protocol(self) -> BridgeProtocol:
+        return BridgeProtocol.MESSAGES_API
+
+    def build_spawn_config(self, profile, bridge_port: int, resolved_key: str) -> SpawnConfig:
+        return SpawnConfig(env_overrides={}, env_clear=[], cli_args=[])
+
+
+class TestMessagesStreamingRetry:
+    @pytest.mark.asyncio
+    async def test_instream_error_after_partial_output_does_not_retry(self):
+        """Messages streaming should not retry once client-visible output has started."""
+        backends = _make_backends(2)
+        server = BridgeServer(
+            adapter=_MessagesLauncher(),
+            provider=backends[0][0],
+            resolved_key=backends[0][1],
+            model="model-0",
+            backends=backends,
+        )
+        port = await server.start_async()
+        try:
+            first_url = "https://api0.example.com/v1/chat/completions"
+            second_url = "https://api1.example.com/v1/chat/completions"
+            hello_chunk = b'data: {"id":"1","choices":[{"index":0,"delta":{"content":"Hello"},'
+            hello_chunk += b'"finish_reason":null}],"model":"test-model"}\n\n'
+            error_chunk = b'data: {"error":{"message":"boom"}}\n\n'
+            partial_stream = hello_chunk + error_chunk
+            msg_req = {
+                "model": "model-0",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 1024,
+                "stream": True,
+            }
+            with aioresponses(passthrough=["http://127.0.0.1"]) as m:
+                m.post(first_url, body=partial_stream, headers={"Content-Type": "text/event-stream"})
+                m.post(second_url, body=partial_stream, headers={"Content-Type": "text/event-stream"})
+                async with (
+                    aiohttp.ClientSession() as session,
+                    session.post(f"http://127.0.0.1:{port}/v1/messages", json=msg_req) as resp,
+                ):
+                    body = await resp.read()
+                    assert resp.status == 200
+                    text = body.decode("utf-8", errors="replace")
+                    assert text.count("event: message_start") == 1
+                    assert "Recovered" not in text
+                    assert "Hello" in text
+                    assert "error" in text
+        finally:
+            await server.stop_async()
+
+    @pytest.mark.asyncio
+    async def test_instream_error_before_output_retries_safely(self):
+        """Messages streaming should retry safely if no output has been emitted yet."""
+        backends = _make_backends(2)
+        server = BridgeServer(
+            adapter=_MessagesLauncher(),
+            provider=backends[0][0],
+            resolved_key=backends[0][1],
+            model="model-0",
+            backends=backends,
+        )
+        random.seed(42)  # deterministic backend selection: api0 first
+        port = await server.start_async()
+        try:
+            first_url = "https://api0.example.com/v1/chat/completions"
+            second_url = "https://api1.example.com/v1/chat/completions"
+            error_stream = b'data: {"error":{"message":"boom"}}\n\n'
+            rec_chunk = b'data: {"id":"2","choices":[{"index":0,"delta":{"content":"Recovered"},'
+            rec_chunk += b'"finish_reason":null}],"model":"test-model"}\n\n'
+            rec_finish = b'data: {"id":"2","choices":[{"index":0,"delta":{},'
+            rec_finish += b'"finish_reason":"stop"}],"model":"test-model"}\n\n'
+            recovery_stream = rec_chunk + rec_finish + b"data: [DONE]\n\n"
+            msg_req = {
+                "model": "model-0",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 1024,
+                "stream": True,
+            }
+            with aioresponses(passthrough=["http://127.0.0.1"]) as m:
+                m.post(first_url, body=error_stream, headers={"Content-Type": "text/event-stream"})
+                m.post(second_url, body=recovery_stream, headers={"Content-Type": "text/event-stream"})
+                async with (
+                    aiohttp.ClientSession() as session,
+                    session.post(f"http://127.0.0.1:{port}/v1/messages", json=msg_req) as resp,
+                ):
+                    body = await resp.read()
+                    assert resp.status == 200
+                    text = body.decode("utf-8", errors="replace")
+                    assert text.count("event: message_start") == 1
+                    assert "Recovered" in text
+        finally:
+            await server.stop_async()
+
+
 class TestBalancingIntegration:
     @pytest.mark.asyncio
     async def test_chat_completions_uses_balancing(self):

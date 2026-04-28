@@ -95,7 +95,7 @@ def _truncate_for_log(text: str, limit: int = 2000) -> str:
 class UpstreamError(Exception):
     """Raised when the upstream provider returns a non-retryable error or retries are exhausted."""
 
-    def __init__(self, status: int, body: dict) -> None:
+    def __init__(self, status: int, body: object) -> None:
         self.status = status
         self.body = body
         super().__init__(f"Upstream error {status}: {body}")
@@ -971,6 +971,8 @@ class BridgeServer:
                                 seq=translator._next_seq(),
                             )
                             await sr.write(error_event.encode())
+                            if self._backends and self._current_backend_idx >= 0:
+                                self._mark_backend_unhealthy(self._current_backend_idx, failure_kind="cloudflare")
                             break
 
                         # In balancing mode: mark unhealthy, try next backend
@@ -1018,6 +1020,7 @@ class BridgeServer:
                     chunk_count = 0
                     done = False
                     stream_error = False
+                    events_emitted = False
                     finish_events: list[str] = []  # buffered finish events
                     async for chunk_bytes in upstream.content:
                         chunk_count += 1
@@ -1065,6 +1068,7 @@ class BridgeServer:
                                     for event in events:
                                         logger.debug("SSE → %s", event.split("\n", 1)[0][:120])
                                         await sr.write(event.encode())
+                                        events_emitted = True
 
                     logger.debug(
                         "Upstream stream ended. chunks=%d done=%s remaining_buffer=%d chars",
@@ -1090,12 +1094,19 @@ class BridgeServer:
                                         for event in events:
                                             logger.debug("SSE (flush) → %s", event.split("\n", 1)[0][:120])
                                             await sr.write(event.encode())
+                                            events_emitted = True
                                 except json.JSONDecodeError:
                                     logger.warning("Failed to parse flushed SSE data: %s", data_str[:200])
 
                     # Handle in-stream error failover
                     if stream_error:
-                        if attempt < max_attempts - 1:
+                        if events_emitted:
+                            logger.warning(
+                                "Responses stream error after client events emitted; not retrying"
+                            )
+                        elif attempt < max_attempts - 1:
+                            translator.reset()
+                            finish_events.clear()
                             self._select_backend()
                             self._normalize_model(cc_request)
                             self._active_provider.normalize_request(cc_request)
@@ -1103,7 +1114,8 @@ class BridgeServer:
                             headers = self._build_upstream_headers()
                             upstream_body = self._active_provider.translate_to_upstream(cc_request)
                             logger.info(
-                                "Responses stream failover: in-stream error, backend attempt %d/%d, switching backend",
+                                "Responses stream failover: in-stream error (no output yet), "
+                                "backend attempt %d/%d, switching backend",
                                 attempt + 1,
                                 max_attempts,
                             )
@@ -1493,6 +1505,8 @@ class BridgeServer:
                                     {"type": "error", "error": {"type": "api_error", "message": error_msg}},
                                 )
                                 await sr.write(error_event.encode())
+                                if self._backends and self._current_backend_idx >= 0:
+                                    self._mark_backend_unhealthy(self._current_backend_idx, failure_kind="cloudflare")
                                 break
 
                             retryable = self._should_retry_stream(upstream.status, error_body)
@@ -1532,6 +1546,7 @@ class BridgeServer:
                         line_buffer = ""
                         done = False
                         stream_error = False
+                        events_emitted = False
                         chunk_count = 0
                         finish_events: list[str] = []  # buffered finish events
                         async for chunk_bytes in upstream.content:
@@ -1578,6 +1593,7 @@ class BridgeServer:
                                     else:
                                         for event in events:
                                             await sr.write(event.encode())
+                                            events_emitted = True
 
                         logger.debug("Upstream stream ended. chunks=%d done=%s", chunk_count, done)
 
@@ -1601,7 +1617,25 @@ class BridgeServer:
 
                         # Handle in-stream error failover
                         if stream_error:
-                            if attempt < max_attempts - 1:
+                            if events_emitted:
+                                # Partial output already sent — retrying would duplicate lifecycle events
+                                logger.warning(
+                                    "Messages stream error after client events emitted; not retrying"
+                                )
+                                error_event = messages_format_error(
+                                    {
+                                        "type": "error",
+                                        "error": {
+                                            "type": "api_error",
+                                            "message": "Upstream stream error during response",
+                                        },
+                                    },
+                                )
+                                await sr.write(error_event.encode())
+                                break
+                            elif attempt < max_attempts - 1:
+                                translator.reset()
+                                finish_events.clear()
                                 self._select_backend()
                                 self._normalize_model(cc_request)
                                 self._active_provider.normalize_request(cc_request)
@@ -1609,7 +1643,7 @@ class BridgeServer:
                                 headers = self._build_upstream_headers()
                                 upstream_body = self._active_provider.translate_to_upstream(cc_request)
                                 logger.info(
-                                    "Messages stream in-stream error: attempt %d/%d, switching backend",
+                                    "Messages stream in-stream error (no output yet): attempt %d/%d, switching backend",
                                     attempt + 1,
                                     max_attempts,
                                 )
@@ -1950,6 +1984,8 @@ class BridgeServer:
                                 await sr.write(error_sse.encode())
                             except (ConnectionResetError, BrokenPipeError, OSError):
                                 logger.debug("Client disconnected before Cloudflare error event")
+                            if self._backends and self._current_backend_idx >= 0:
+                                self._mark_backend_unhealthy(self._current_backend_idx, failure_kind="cloudflare")
                             break
 
                         # In balancing mode: mark unhealthy, try next backend
@@ -2214,7 +2250,12 @@ class BridgeServer:
                 last_exc = exc
                 idx = self._current_backend_idx
                 if idx >= 0:
-                    failure_kind = "rate_limit" if exc.status == 429 else "hard"
+                    if exc.status == 429:
+                        failure_kind = "rate_limit"
+                    elif isinstance(exc.body, str) and self._is_cloudflare_block(exc.status, exc.body):
+                        failure_kind = "cloudflare"
+                    else:
+                        failure_kind = "hard"
                     self._mark_backend_unhealthy(idx, failure_kind=failure_kind)
                 logger.info(
                     "Backend attempt %d/%d failed (status %d), retrying",
@@ -2468,6 +2509,8 @@ class BridgeServer:
                                 await sr.write(error_sse.encode())
                             except (ConnectionResetError, BrokenPipeError, OSError):
                                 logger.debug("Client disconnected before Cloudflare error event")
+                            if self._backends and self._current_backend_idx >= 0:
+                                self._mark_backend_unhealthy(self._current_backend_idx, failure_kind="cloudflare")
                             break
 
                         # In balancing mode: mark unhealthy, try next backend
@@ -3106,14 +3149,14 @@ class BridgeServer:
         request_timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=_STREAM_READ_TIMEOUT)
 
         last_status = 0
-        last_body: dict = {}
+        last_body: object = {}
         for attempt in range(_MAX_RETRIES + 1):
             async with session.post(url, json=upstream_body, headers=headers, timeout=request_timeout) as resp:
                 last_status = resp.status
                 try:
                     last_body = await resp.json()
                 except Exception:
-                    last_body = {}
+                    last_body = await resp.text()
 
                 if last_status < 400:
                     return self._active_provider.translate_from_upstream(last_body)
